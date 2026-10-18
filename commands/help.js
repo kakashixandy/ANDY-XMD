@@ -103,7 +103,9 @@ async function helpCommand(sock, chatId, message) {
 ╰═════Aɴᴅʏ-Tᴇᴄʜ❦══════❏
 
 ╭════〔 🎮 *Game Commands* 〕═══❏
-│┃➥ .tictactoe @user
+│┃➥ .ttt @user
+│┃➥ .ttt join
+│┃➥ .ttt stop /.ttt surrender
 │┃➥ .hangman
 │┃➥ .guess <letter>
 │┃➥ .trivia

@@ -116,10 +116,10 @@ async function helpCommand(sock, chatId, message) {
 │┃➥ .truth
 │┃➥ .dare
 ╰═════Aɴᴅʏ-Tᴇᴄʜ❦══════❏
-
 ╭════〔 💰 *Economy Commands* 〕═══❏
 │┃➥ .start or .register
 │┃➥ .balance or .bal
+│┃➥ .profile or .profile @user
 │┃➥ .deposit <amount> or .dep all
 │┃➥ .withdraw <amount> or .with all
 │┃➥ .daily
@@ -133,6 +133,15 @@ async function helpCommand(sock, chatId, message) {
 │┃➥ .slots <amount>
 │┃➥ .blackjack <amount>
 │┃➥ .rob @user
+│┃➥ .pay <amount> @user
+│┃➥ .marry @user
+│┃➥ .acceptmarry
+│┃➥ .divorce
+│┃➥ .borrow <amount> @user
+│┃➥ .lend <amount> @user
+│┃➥ .acceptborrow @user
+│┃➥ .repay <amount|all> @user
+│┃➥ .sue @user
 │┃➥ .shop
 │┃➥ .buy <item id>
 │┃➥ .inventory or .inv

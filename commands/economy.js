@@ -1,8 +1,21 @@
-// In-memory economy store (temporary — will be swapped for Google Sheets storage later)
-// Resets whenever the bot restarts.
-const accounts = new Map(); // jid -> { wallet, bank, inventory: {}, cooldowns: {} }
+const fs = require('fs');
+const path = require('path');
+
+// Economy store: one account per USER (not per chat), saved to disk so it survives restarts.
+const DATA_FILE = path.join(__dirname, 'data', 'economy.json');
+const accounts = new Map(); // jid -> { wallet, bank, inventory, cooldowns, partner, marriedAt, debts: [] }
+
+// Pending requests (not saved, expire after 5 min)
+const pendingMarry = new Map(); // targetJid -> { from, expires }
+const pendingLoans = new Map(); // id -> { type: 'borrow'|'lend', from, to, amount, expires }
 
 const STARTING_BALANCE = 200000;
+const LOAN_INTEREST = 0.10;              // 10% flat interest
+const LOAN_DURATION = 7 * 60 * 60 * 1000; // 7 hours to repay
+const POLICE_FEE_RATE = 0.10;             // police charges = 10% of the remaining debt
+const POLICE_FEE_MIN = 500;               // ...but never less than this
+const SUE_COOLDOWN = 60 * 60 * 1000;      // a lender can sue the same debt once per hour
+const REQUEST_TTL = 5 * 60 * 1000;
 
 const COOLDOWNS = {
     daily: 24 * 60 * 60 * 1000,
@@ -22,20 +35,68 @@ const SHOP_ITEMS = {
     lockbox: { name: '🔒 Lockbox', price: 15000, desc: 'Protects 20% of your bank from being robbed' },
 };
 
+/* ===================== STORAGE ===================== */
+
+function normalizeJid(jid) {
+    if (!jid || typeof jid !== 'string' || !jid.includes('@')) return jid;
+    const [user, server] = jid.split('@');
+    return `${user.split(':')[0]}@${server}`; // strips device suffix like ":12"
+}
+
+function loadData() {
+    try {
+        if (!fs.existsSync(DATA_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+        for (const [jid, acc] of Object.entries(raw)) {
+            accounts.set(jid, {
+                wallet: acc.wallet ?? 0,
+                bank: acc.bank ?? 0,
+                inventory: acc.inventory || {},
+                cooldowns: acc.cooldowns || {},
+                partner: acc.partner || null,
+                marriedAt: acc.marriedAt || null,
+                debts: acc.debts || [],
+            });
+        }
+    } catch (e) {
+        console.error('Failed to load economy data:', e);
+    }
+}
+
+let saveTimer = null;
+function saveSoon() {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => {
+        saveTimer = null;
+        try {
+            fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+            fs.writeFileSync(DATA_FILE, JSON.stringify(Object.fromEntries(accounts)));
+        } catch (e) {
+            console.error('Failed to save economy data:', e);
+        }
+    }, 1000);
+}
+
+loadData();
+
 function getAccount(jid) {
+    jid = normalizeJid(jid);
     if (!accounts.has(jid)) {
         accounts.set(jid, {
             wallet: STARTING_BALANCE,
             bank: 0,
             inventory: {},
-            cooldowns: {}
+            cooldowns: {},
+            partner: null,
+            marriedAt: null,
+            debts: [],
         });
     }
     return accounts.get(jid);
 }
 
 function hasAccount(jid) {
-    return accounts.has(jid);
+    return accounts.has(normalizeJid(jid));
 }
 
 function getBalance(jid) {
@@ -45,6 +106,8 @@ function getBalance(jid) {
 function setBalance(jid, amount) {
     getAccount(jid).wallet = amount;
 }
+
+/* ===================== HELPERS ===================== */
 
 function onCooldown(jid, key) {
     const acc = getAccount(jid);
@@ -59,10 +122,12 @@ function setCooldown(jid, key) {
 
 function formatTime(ms) {
     const totalSec = Math.ceil(ms / 1000);
-    const h = Math.floor(totalSec / 3600);
+    const d = Math.floor(totalSec / 86400);
+    const h = Math.floor((totalSec % 86400) / 3600);
     const m = Math.floor((totalSec % 3600) / 60);
     const s = totalSec % 60;
     const parts = [];
+    if (d) parts.push(`${d}d`);
     if (h) parts.push(`${h}h`);
     if (m) parts.push(`${m}m`);
     if (s || parts.length === 0) parts.push(`${s}s`);
@@ -73,8 +138,16 @@ function fmt(n) {
     return Math.floor(n).toLocaleString();
 }
 
+function tag(jid) {
+    return `@${jid.split('@')[0]}`;
+}
+
 async function reply(sock, chatId, message, text) {
     await sock.sendMessage(chatId, { text }, { quoted: message });
+}
+
+async function replyMention(sock, chatId, message, text, mentions) {
+    await sock.sendMessage(chatId, { text, mentions }, { quoted: message });
 }
 
 async function requireAccount(sock, chatId, message, senderId) {
@@ -94,6 +167,18 @@ async function requireCooldown(sock, chatId, message, senderId, key, label) {
     return true;
 }
 
+function parseAmount(args) {
+    const first = (args || '').trim().split(/\s+/)[0];
+    const n = parseInt(first, 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function cleanExpired() {
+    const now = Date.now();
+    for (const [k, v] of pendingMarry) if (v.expires < now) pendingMarry.delete(k);
+    for (const [k, v] of pendingLoans) if (v.expires < now) pendingLoans.delete(k);
+}
+
 /* ===================== ACCOUNT ===================== */
 
 async function startCommand(sock, chatId, message, senderId) {
@@ -108,7 +193,8 @@ async function startCommand(sock, chatId, message, senderId) {
         getAccount(senderId); // creates with starting balance
 
         await reply(sock, chatId, message,
-            `🎉 *Welcome to the economy!*\n\n💰 You've been given *${fmt(STARTING_BALANCE)} coins* to start.\n\n` +
+            `🎉 *Welcome to the economy!*\n\n💰 You've been given *${fmt(STARTING_BALANCE)} coins* to start.\n` +
+            `🌍 Your account works in *every chat*.\n\n` +
             `Type *.balance* to check your coins, or *.shop* to see what you can buy.`);
 
     } catch (error) {
@@ -127,6 +213,87 @@ async function balanceCommand(sock, chatId, message, senderId) {
 
     } catch (error) {
         console.error('Error in balance command:', error);
+        await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
+    }
+}
+
+/* ===================== PROFILE ===================== */
+
+async function profileCommand(sock, chatId, message, senderId, mentionedJid = []) {
+    try {
+        if (!(await requireAccount(sock, chatId, message, senderId))) return;
+
+        const targetJid = (mentionedJid && mentionedJid[0]) || senderId;
+        if (!hasAccount(targetJid)) {
+            await reply(sock, chatId, message, '❌ That user doesn\'t have an account yet.');
+            return;
+        }
+
+        const acc = getAccount(targetJid);
+        const isSelf = targetJid === senderId;
+        const mentions = [targetJid];
+
+        let text = `👤 *Profile* — ${tag(targetJid)}\n\n`;
+        text += `💰 Wallet: *${fmt(acc.wallet)}*\n🏦 Bank: *${fmt(acc.bank)}*\n💵 Net Worth: *${fmt(acc.wallet + acc.bank)}*\n\n`;
+
+        // Partner
+        if (acc.partner) {
+            mentions.push(acc.partner);
+            const since = acc.marriedAt ? ` (for ${formatTime(Date.now() - acc.marriedAt)})` : '';
+            text += `💍 Partner: ${tag(acc.partner)}${since}\n\n`;
+        } else {
+            text += `💍 Partner: _Single_\n\n`;
+        }
+
+        // Inventory
+        const owned = Object.keys(acc.inventory).filter(id => acc.inventory[id]);
+        text += `📦 Items: ${owned.length ? owned.map(id => SHOP_ITEMS[id]?.name || id).join(', ') : '_none_'}\n\n`;
+
+        // Debts (what they owe)
+        const now = Date.now();
+        if (acc.debts.length) {
+            text += `📉 *Debts (you owe)*\n`;
+            for (const d of acc.debts) {
+                mentions.push(d.lender);
+                const left = d.due - now;
+                const status = left > 0 ? `due in ${formatTime(left)}` : `⚠️ OVERDUE by ${formatTime(-left)}`;
+                text += `• ${fmt(d.owed)} to ${tag(d.lender)} — ${status}\n`;
+            }
+            text += '\n';
+        } else {
+            text += `📉 Debts: _none_\n\n`;
+        }
+
+        // Receivables (what others owe them)
+        const receivables = [];
+        for (const [jid, other] of accounts) {
+            for (const d of other.debts) {
+                if (d.lender === targetJid) receivables.push({ borrower: jid, ...d });
+            }
+        }
+        if (receivables.length) {
+            text += `📈 *Owed to you*\n`;
+            for (const r of receivables) {
+                mentions.push(r.borrower);
+                const left = r.due - now;
+                const status = left > 0 ? `due in ${formatTime(left)}` : `⚠️ OVERDUE`;
+                text += `• ${tag(r.borrower)} owes ${fmt(r.owed)} — ${status}\n`;
+            }
+            text += '\n';
+        }
+
+        // Cooldowns
+        text += `⏳ *Cooldowns*\n`;
+        for (const key of Object.keys(COOLDOWNS)) {
+            const last = acc.cooldowns[key] || 0;
+            const remaining = (last + COOLDOWNS[key]) - now;
+            text += remaining > 0 ? `• .${key}: ${formatTime(remaining)}\n` : `• .${key}: ✅ ready\n`;
+        }
+
+        await replyMention(sock, chatId, message, text.trim(), [...new Set(mentions)]);
+
+    } catch (error) {
+        console.error('Error in profile command:', error);
         await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
     }
 }
@@ -593,17 +760,449 @@ async function robCommand(sock, chatId, message, senderId, mentionedJid = []) {
             const stolen = Math.min(Math.floor(target.wallet * stealPercent), 10000);
             target.wallet -= stolen;
             robber.wallet += stolen;
-            await reply(sock, chatId, message, `🦹 You successfully robbed @${targetJid.split('@')[0]} and got away with *${fmt(stolen)}* coins!`);
+            await replyMention(sock, chatId, message, `🦹 You successfully robbed ${tag(targetJid)} and got away with *${fmt(stolen)}* coins!`, [targetJid]);
         } else {
             const fine = Math.min(Math.floor(robber.wallet * 0.15), 5000);
             const actualFine = Math.min(fine, robber.wallet);
             robber.wallet -= actualFine;
             target.wallet += actualFine;
-            await reply(sock, chatId, message, `🚨 You got caught trying to rob @${targetJid.split('@')[0]}! You paid a fine of *${fmt(actualFine)}* coins to them.`);
+            await replyMention(sock, chatId, message, `🚨 You got caught trying to rob ${tag(targetJid)}! You paid a fine of *${fmt(actualFine)}* coins to them.`, [targetJid]);
         }
 
     } catch (error) {
         console.error('Error in rob command:', error);
+        await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
+    }
+}
+
+/* ===================== PAY ===================== */
+
+async function payCommand(sock, chatId, message, senderId, args, mentionedJid = []) {
+    try {
+        if (!(await requireAccount(sock, chatId, message, senderId))) return;
+
+        const amount = parseAmount(args);
+        const targetJid = mentionedJid && mentionedJid[0];
+
+        if (!amount || !targetJid) {
+            await reply(sock, chatId, message, '*Usage:* .pay <amount> @user');
+            return;
+        }
+        if (targetJid === senderId) {
+            await reply(sock, chatId, message, '❌ You cannot pay yourself.');
+            return;
+        }
+        if (!hasAccount(targetJid)) {
+            await reply(sock, chatId, message, '❌ That user doesn\'t have an account yet.');
+            return;
+        }
+
+        const acc = getAccount(senderId);
+        if (amount > acc.wallet) {
+            await reply(sock, chatId, message, `❌ You only have *${fmt(acc.wallet)}* in your wallet.`);
+            return;
+        }
+
+        acc.wallet -= amount;
+        getAccount(targetJid).wallet += amount;
+
+        await replyMention(sock, chatId, message,
+            `💸 You paid *${fmt(amount)}* coins to ${tag(targetJid)}.\n💰 Wallet: ${fmt(acc.wallet)}`, [targetJid]);
+
+    } catch (error) {
+        console.error('Error in pay command:', error);
+        await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
+    }
+}
+
+/* ===================== MARRIAGE ===================== */
+
+async function marryCommand(sock, chatId, message, senderId, mentionedJid = []) {
+    try {
+        if (!(await requireAccount(sock, chatId, message, senderId))) return;
+        cleanExpired();
+
+        const targetJid = mentionedJid && mentionedJid[0];
+        if (!targetJid) {
+            await reply(sock, chatId, message, '*Usage:* .marry @user');
+            return;
+        }
+        if (targetJid === senderId) {
+            await reply(sock, chatId, message, '❌ You cannot marry yourself.');
+            return;
+        }
+        if (!hasAccount(targetJid)) {
+            await reply(sock, chatId, message, '❌ That user doesn\'t have an account yet.');
+            return;
+        }
+
+        const me = getAccount(senderId);
+        const them = getAccount(targetJid);
+
+        if (me.partner) {
+            await replyMention(sock, chatId, message, `❌ You're already married to ${tag(me.partner)}. Use *.divorce* first.`, [me.partner]);
+            return;
+        }
+        if (them.partner) {
+            await replyMention(sock, chatId, message, `❌ ${tag(targetJid)} is already married.`, [targetJid]);
+            return;
+        }
+
+        pendingMarry.set(targetJid, { from: senderId, expires: Date.now() + REQUEST_TTL });
+
+        await replyMention(sock, chatId, message,
+            `💍 ${tag(senderId)} has proposed to ${tag(targetJid)}!\n\n${tag(targetJid)}, type *.acceptmarry* within 5 minutes to say yes.`,
+            [senderId, targetJid]);
+
+    } catch (error) {
+        console.error('Error in marry command:', error);
+        await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
+    }
+}
+
+async function acceptMarryCommand(sock, chatId, message, senderId) {
+    try {
+        if (!(await requireAccount(sock, chatId, message, senderId))) return;
+        cleanExpired();
+
+        const proposal = pendingMarry.get(senderId);
+        if (!proposal) {
+            await reply(sock, chatId, message, '❌ You have no pending marriage proposals.');
+            return;
+        }
+
+        const proposerJid = proposal.from;
+        const me = getAccount(senderId);
+        const proposer = getAccount(proposerJid);
+
+        if (me.partner || proposer.partner) {
+            pendingMarry.delete(senderId);
+            await reply(sock, chatId, message, '❌ One of you is already married.');
+            return;
+        }
+
+        me.partner = proposerJid;
+        proposer.partner = senderId;
+        me.marriedAt = proposer.marriedAt = Date.now();
+        pendingMarry.delete(senderId);
+
+        await replyMention(sock, chatId, message,
+            `💒 *Congratulations!* ${tag(proposerJid)} and ${tag(senderId)} are now married! 🎉`,
+            [proposerJid, senderId]);
+
+    } catch (error) {
+        console.error('Error in acceptmarry command:', error);
+        await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
+    }
+}
+
+async function divorceCommand(sock, chatId, message, senderId) {
+    try {
+        if (!(await requireAccount(sock, chatId, message, senderId))) return;
+
+        const me = getAccount(senderId);
+        if (!me.partner) {
+            await reply(sock, chatId, message, '❌ You\'re not married.');
+            return;
+        }
+
+        const exJid = me.partner;
+        if (hasAccount(exJid)) {
+            const ex = getAccount(exJid);
+            ex.partner = null;
+            ex.marriedAt = null;
+        }
+        me.partner = null;
+        me.marriedAt = null;
+
+        await replyMention(sock, chatId, message,
+            `💔 ${tag(senderId)} has divorced ${tag(exJid)}.`, [senderId, exJid]);
+
+    } catch (error) {
+        console.error('Error in divorce command:', error);
+        await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
+    }
+}
+
+/* ===================== LOANS ===================== */
+
+function loanKey(type, from, to) {
+    return `${type}:${from}:${to}`;
+}
+
+// .borrow <amount> @lender  -> you ask someone to lend you money
+async function borrowCommand(sock, chatId, message, senderId, args, mentionedJid = []) {
+    try {
+        if (!(await requireAccount(sock, chatId, message, senderId))) return;
+        cleanExpired();
+
+        const amount = parseAmount(args);
+        const lenderJid = mentionedJid && mentionedJid[0];
+
+        if (!amount || !lenderJid) {
+            await reply(sock, chatId, message, '*Usage:* .borrow <amount> @user');
+            return;
+        }
+        if (lenderJid === senderId) {
+            await reply(sock, chatId, message, '❌ You cannot borrow from yourself.');
+            return;
+        }
+        if (!hasAccount(lenderJid)) {
+            await reply(sock, chatId, message, '❌ That user doesn\'t have an account yet.');
+            return;
+        }
+        if (amount < 100) {
+            await reply(sock, chatId, message, '❌ Minimum loan is *100* coins.');
+            return;
+        }
+
+        pendingLoans.set(loanKey('borrow', senderId, lenderJid), {
+            type: 'borrow', from: senderId, to: lenderJid, amount, expires: Date.now() + REQUEST_TTL
+        });
+
+        const owed = Math.ceil(amount * (1 + LOAN_INTEREST));
+        await replyMention(sock, chatId, message,
+            `🏦 ${tag(senderId)} wants to borrow *${fmt(amount)}* coins from ${tag(lenderJid)}.\n` +
+            `📈 Interest: *${LOAN_INTEREST * 100}%* → repay *${fmt(owed)}* within *${formatTime(LOAN_DURATION)}*.\n\n` +
+            `${tag(lenderJid)}, type *.acceptborrow ${tag(senderId)}* to approve.`,
+            [senderId, lenderJid]);
+
+    } catch (error) {
+        console.error('Error in borrow command:', error);
+        await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
+    }
+}
+
+// .lend <amount> @borrower -> you offer to lend someone money
+async function lendCommand(sock, chatId, message, senderId, args, mentionedJid = []) {
+    try {
+        if (!(await requireAccount(sock, chatId, message, senderId))) return;
+        cleanExpired();
+
+        const amount = parseAmount(args);
+        const borrowerJid = mentionedJid && mentionedJid[0];
+
+        if (!amount || !borrowerJid) {
+            await reply(sock, chatId, message, '*Usage:* .lend <amount> @user');
+            return;
+        }
+        if (borrowerJid === senderId) {
+            await reply(sock, chatId, message, '❌ You cannot lend to yourself.');
+            return;
+        }
+        if (!hasAccount(borrowerJid)) {
+            await reply(sock, chatId, message, '❌ That user doesn\'t have an account yet.');
+            return;
+        }
+        if (amount < 100) {
+            await reply(sock, chatId, message, '❌ Minimum loan is *100* coins.');
+            return;
+        }
+        if (amount > getAccount(senderId).wallet) {
+            await reply(sock, chatId, message, `❌ You only have *${fmt(getAccount(senderId).wallet)}* in your wallet.`);
+            return;
+        }
+
+        pendingLoans.set(loanKey('lend', senderId, borrowerJid), {
+            type: 'lend', from: senderId, to: borrowerJid, amount, expires: Date.now() + REQUEST_TTL
+        });
+
+        const owed = Math.ceil(amount * (1 + LOAN_INTEREST));
+        await replyMention(sock, chatId, message,
+            `🤝 ${tag(senderId)} offers to lend *${fmt(amount)}* coins to ${tag(borrowerJid)}.\n` +
+            `📈 Interest: *${LOAN_INTEREST * 100}%* → repay *${fmt(owed)}* within *${formatTime(LOAN_DURATION)}*.\n\n` +
+            `${tag(borrowerJid)}, type *.acceptborrow ${tag(senderId)}* to accept.`,
+            [senderId, borrowerJid]);
+
+    } catch (error) {
+        console.error('Error in lend command:', error);
+        await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
+    }
+}
+
+// .acceptborrow @user -> accept a loan request (as lender) or a loan offer (as borrower)
+async function acceptBorrowCommand(sock, chatId, message, senderId, mentionedJid = []) {
+    try {
+        if (!(await requireAccount(sock, chatId, message, senderId))) return;
+        cleanExpired();
+
+        const otherJid = mentionedJid && mentionedJid[0];
+        if (!otherJid) {
+            await reply(sock, chatId, message, '*Usage:* .acceptborrow @user');
+            return;
+        }
+
+        // Either they asked to borrow from me, or they offered to lend to me
+        const keyBorrow = loanKey('borrow', otherJid, senderId);
+        const keyLend = loanKey('lend', otherJid, senderId);
+        const key = pendingLoans.has(keyBorrow) ? keyBorrow : (pendingLoans.has(keyLend) ? keyLend : null);
+
+        if (!key) {
+            await reply(sock, chatId, message, '❌ No pending loan request/offer from that user.');
+            return;
+        }
+
+        const req = pendingLoans.get(key);
+        const lenderJid = req.type === 'borrow' ? req.to : req.from;
+        const borrowerJid = req.type === 'borrow' ? req.from : req.to;
+
+        const lender = getAccount(lenderJid);
+        const borrower = getAccount(borrowerJid);
+
+        if (lender.wallet < req.amount) {
+            pendingLoans.delete(key);
+            await replyMention(sock, chatId, message, `❌ ${tag(lenderJid)} no longer has *${fmt(req.amount)}* coins in their wallet.`, [lenderJid]);
+            return;
+        }
+
+        const owed = Math.ceil(req.amount * (1 + LOAN_INTEREST));
+        lender.wallet -= req.amount;
+        borrower.wallet += req.amount;
+        borrower.debts.push({
+            lender: lenderJid,
+            principal: req.amount,
+            owed,
+            due: Date.now() + LOAN_DURATION,
+        });
+        pendingLoans.delete(key);
+
+        await replyMention(sock, chatId, message,
+            `✅ *Loan approved!*\n${tag(lenderJid)} lent *${fmt(req.amount)}* coins to ${tag(borrowerJid)}.\n` +
+            `📉 ${tag(borrowerJid)} owes *${fmt(owed)}* coins (incl. ${LOAN_INTEREST * 100}% interest), due in *${formatTime(LOAN_DURATION)}*.\n\n` +
+            `Repay with *.repay <amount|all> @${lenderJid.split('@')[0]}*\n` +
+            `⚠️ If it's late, the lender can *.sue* and the court will seize the money + police charges.`,
+            [lenderJid, borrowerJid]);
+
+    } catch (error) {
+        console.error('Error in acceptborrow command:', error);
+        await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
+    }
+}
+
+// .repay @lender <amount|all>
+async function repayCommand(sock, chatId, message, senderId, args, mentionedJid = []) {
+    try {
+        if (!(await requireAccount(sock, chatId, message, senderId))) return;
+
+        const lenderJid = mentionedJid && mentionedJid[0];
+        const parts = (args || '').trim().split(/\s+/);
+        const wantsAll = parts.some(p => p.toLowerCase() === 'all');
+        const amountArg = parts.map(p => parseInt(p, 10)).find(n => Number.isFinite(n) && n > 0);
+
+        if (!lenderJid || (!wantsAll && !amountArg)) {
+            await reply(sock, chatId, message, '*Usage:* .repay <amount|all> @user');
+            return;
+        }
+
+        const me = getAccount(senderId);
+        const debt = me.debts.find(d => d.lender === lenderJid);
+        if (!debt) {
+            await reply(sock, chatId, message, '❌ You don\'t owe that user anything.');
+            return;
+        }
+
+        let pay = wantsAll ? debt.owed : amountArg;
+        pay = Math.min(pay, debt.owed, me.wallet);
+        if (pay <= 0) {
+            await reply(sock, chatId, message, '❌ You don\'t have any coins in your wallet to repay with.');
+            return;
+        }
+
+        me.wallet -= pay;
+        if (hasAccount(lenderJid)) getAccount(lenderJid).wallet += pay;
+        debt.owed -= pay;
+
+        let text;
+        if (debt.owed <= 0) {
+            me.debts.splice(me.debts.indexOf(debt), 1);
+            text = `✅ You repaid *${fmt(pay)}* coins to ${tag(lenderJid)}. Debt fully cleared! 🎉`;
+        } else {
+            text = `💸 You repaid *${fmt(pay)}* coins to ${tag(lenderJid)}.\n📉 Remaining debt: *${fmt(debt.owed)}*`;
+        }
+
+        await replyMention(sock, chatId, message, text, [lenderJid]);
+
+    } catch (error) {
+        console.error('Error in repay command:', error);
+        await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
+    }
+}
+
+// .sue @borrower -> force repayment of an OVERDUE loan (debt + police charges)
+async function sueCommand(sock, chatId, message, senderId, mentionedJid = []) {
+    try {
+        if (!(await requireAccount(sock, chatId, message, senderId))) return;
+
+        const borrowerJid = mentionedJid && mentionedJid[0];
+        if (!borrowerJid) {
+            await reply(sock, chatId, message, '*Usage:* .sue @user');
+            return;
+        }
+        if (borrowerJid === senderId) {
+            await reply(sock, chatId, message, '❌ You cannot sue yourself.');
+            return;
+        }
+        if (!hasAccount(borrowerJid)) {
+            await reply(sock, chatId, message, '❌ That user doesn\'t have an account.');
+            return;
+        }
+
+        const borrower = getAccount(borrowerJid);
+        const debt = borrower.debts.find(d => d.lender === senderId);
+        if (!debt) {
+            await replyMention(sock, chatId, message, `❌ ${tag(borrowerJid)} doesn't owe you anything.`, [borrowerJid]);
+            return;
+        }
+
+        const now = Date.now();
+        if (debt.due > now) {
+            await replyMention(sock, chatId, message,
+                `⚖️ You can't sue yet. ${tag(borrowerJid)} still has *${formatTime(debt.due - now)}* to repay.`, [borrowerJid]);
+            return;
+        }
+        if (debt.suedAt && now - debt.suedAt < SUE_COOLDOWN) {
+            await reply(sock, chatId, message,
+                `⏳ You already sued over this debt. You can sue again in *${formatTime(SUE_COOLDOWN - (now - debt.suedAt))}*.`);
+            return;
+        }
+
+        const lender = getAccount(senderId);
+        const policeFee = Math.max(POLICE_FEE_MIN, Math.ceil(debt.owed * POLICE_FEE_RATE));
+        const totalDue = debt.owed + policeFee;
+
+        // Seize from wallet first, then bank (a Lockbox protects 20% of the bank)
+        const bankSeizable = Math.floor(borrower.bank * (borrower.inventory.lockbox ? 0.8 : 1));
+        const fromWallet = Math.min(borrower.wallet, totalDue);
+        const fromBank = Math.min(bankSeizable, totalDue - fromWallet);
+        const seized = fromWallet + fromBank;
+
+        borrower.wallet -= fromWallet;
+        borrower.bank -= fromBank;
+
+        // Lender is paid first; whatever is left covers the police charges
+        const toLender = Math.min(seized, debt.owed);
+        const toPolice = seized - toLender;
+        lender.wallet += toLender;
+        debt.owed -= toLender;
+        debt.suedAt = now;
+
+        let text = `⚖️ *COURT ORDER* ⚖️\n${tag(senderId)} sued ${tag(borrowerJid)} for an overdue loan.\n\n` +
+            `🚔 Police charges: *${fmt(policeFee)}*\n` +
+            `💰 Seized: *${fmt(seized)}* of *${fmt(totalDue)}* (wallet ${fmt(fromWallet)}, bank ${fmt(fromBank)})\n` +
+            `📥 Paid to ${tag(senderId)}: *${fmt(toLender)}*\n` +
+            `👮 Paid to police: *${fmt(toPolice)}*\n`;
+
+        if (debt.owed <= 0) {
+            borrower.debts.splice(borrower.debts.indexOf(debt), 1);
+            text += `\n✅ Debt fully cleared.`;
+        } else {
+            text += `\n📉 ${tag(borrowerJid)} still owes *${fmt(debt.owed)}* (not enough funds to seize). You can sue again in ${formatTime(SUE_COOLDOWN)}.`;
+        }
+
+        await replyMention(sock, chatId, message, text, [senderId, borrowerJid]);
+
+    } catch (error) {
+        console.error('Error in sue command:', error);
         await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
     }
 }
@@ -709,26 +1308,53 @@ async function leaderboardCommand(sock, chatId, message) {
     }
 }
 
+/* ===================== EXPORTS ===================== */
+
+// Wraps every command so that:
+//  - the sender (and any @mentions) are normalized to ONE id per user → same account in every chat
+//  - data is saved to disk after each command
+function wrap(fn) {
+    return async (...a) => {
+        if (a[3]) a[3] = normalizeJid(a[3]);
+        for (let i = 4; i < a.length; i++) {
+            if (Array.isArray(a[i])) a[i] = a[i].map(normalizeJid);
+        }
+        const result = await fn(...a);
+        saveSoon();
+        return result;
+    };
+}
+
 module.exports = {
-    startCommand,
-    balanceCommand,
-    depositCommand,
-    withdrawCommand,
-    dailyCommand,
-    weeklyCommand,
-    workCommand,
-    begCommand,
-    crimeCommand,
-    searchCommand,
-    fishCommand,
-    huntCommand,
-    slotsCommand,
-    blackjackCommand,
-    robCommand,
-    shopCommand,
-    buyCommand,
-    inventoryCommand,
-    leaderboardCommand,
+    startCommand: wrap(startCommand),
+    balanceCommand: wrap(balanceCommand),
+    profileCommand: wrap(profileCommand),
+    depositCommand: wrap(depositCommand),
+    withdrawCommand: wrap(withdrawCommand),
+    dailyCommand: wrap(dailyCommand),
+    weeklyCommand: wrap(weeklyCommand),
+    workCommand: wrap(workCommand),
+    begCommand: wrap(begCommand),
+    crimeCommand: wrap(crimeCommand),
+    searchCommand: wrap(searchCommand),
+    fishCommand: wrap(fishCommand),
+    huntCommand: wrap(huntCommand),
+    slotsCommand: wrap(slotsCommand),
+    blackjackCommand: wrap(blackjackCommand),
+    robCommand: wrap(robCommand),
+    payCommand: wrap(payCommand),
+    marryCommand: wrap(marryCommand),
+    acceptMarryCommand: wrap(acceptMarryCommand),
+    divorceCommand: wrap(divorceCommand),
+    borrowCommand: wrap(borrowCommand),
+    lendCommand: wrap(lendCommand),
+    acceptBorrowCommand: wrap(acceptBorrowCommand),
+    repayCommand: wrap(repayCommand),
+    sueCommand: wrap(sueCommand),
+    shopCommand: wrap(shopCommand),
+    buyCommand: wrap(buyCommand),
+    inventoryCommand: wrap(inventoryCommand),
+    leaderboardCommand: wrap(leaderboardCommand),
     getBalance,
     setBalance
 };

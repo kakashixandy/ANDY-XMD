@@ -966,6 +966,56 @@ case userMessage.startsWith('.withdraw') || userMessage.startsWith('.with'): {
     await economy.withdrawCommand(sock, chatId, message, senderId, withArgs);
     break;
 }
+case userMessage === '.profile' || userMessage.startsWith('.profile '): {
+    const profMentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    await economy.profileCommand(sock, chatId, message, senderId, profMentioned);
+    break;
+}
+case userMessage.startsWith('.pay'): {
+    const payArgs = userMessage.split(' ').slice(1).join(' ');
+    const payMentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    await economy.payCommand(sock, chatId, message, senderId, payArgs, payMentioned);
+    break;
+}
+case userMessage.startsWith('.marry'): {
+    const marryMentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    await economy.marryCommand(sock, chatId, message, senderId, marryMentioned);
+    break;
+}
+case userMessage === '.acceptmarry':
+    await economy.acceptMarryCommand(sock, chatId, message, senderId);
+    break;
+case userMessage === '.divorce':
+    await economy.divorceCommand(sock, chatId, message, senderId);
+    break;
+case userMessage.startsWith('.borrow'): {
+    const borrowArgs = userMessage.split(' ').slice(1).join(' ');
+    const borrowMentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    await economy.borrowCommand(sock, chatId, message, senderId, borrowArgs, borrowMentioned);
+    break;
+}
+case userMessage.startsWith('.lend'): {
+    const lendArgs = userMessage.split(' ').slice(1).join(' ');
+    const lendMentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    await economy.lendCommand(sock, chatId, message, senderId, lendArgs, lendMentioned);
+    break;
+}
+case userMessage.startsWith('.acceptborrow'): {
+    const accBorrowMentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    await economy.acceptBorrowCommand(sock, chatId, message, senderId, accBorrowMentioned);
+    break;
+}
+case userMessage.startsWith('.repay'): {
+    const repayArgs = userMessage.split(' ').slice(1).join(' ');
+    const repayMentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    await economy.repayCommand(sock, chatId, message, senderId, repayArgs, repayMentioned);
+    break;
+}
+case userMessage.startsWith('.sue'): {
+    const sueMentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    await economy.sueCommand(sock, chatId, message, senderId, sueMentioned);
+    break;
+}
 case userMessage === '.daily':
     await economy.dailyCommand(sock, chatId, message, senderId);
     break;

@@ -797,13 +797,6 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 }
                 await groupInfoCommand(sock, chatId, message);
                 break;
-                case userMessage.startsWith('.gcstatus'):
-                {
-                    const args = userMessage.split(' ').slice(1).join(' ');
-                    const floMessage = message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-                    await gcstoryCommand(sock, chatId, message, floMessage, args);
-                    }
-                    break;
             case userMessage === '.resetlink' || userMessage === '.revoke' || userMessage === '.anularlink':
                 if (!isGroup) {
                     await sock.sendMessage(chatId, { text: 'This command can only be used in groups!', ...channelInfo }, { quoted: message });

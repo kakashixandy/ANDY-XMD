@@ -3,11 +3,7 @@ const fs = require('fs');
 const path = require('path');
 
 async function helpCommand(sock, chatId, message) {
-    const helpMessage = `
-╭════〔 🏔️ *ANDY-XMD V2* 🏔️ 〕═══❏
-│┃➥ *Inspired by the fear of being average*
-╰═════Aɴᴅʏ-Tᴇᴄʜ❦══════❏
-
+    const commandSections = `
 ╭════〔 🌐 *General Commands* 〕═══❏
 │┃➥ .help or .menu
 │┃➥ .ping
@@ -43,6 +39,7 @@ async function helpCommand(sock, chatId, message) {
 │┃➥ .warn @user
 │┃➥ .antilink
 │┃➥ .antibadword
+│┃➥ .antispam
 │┃➥ .clear
 │┃➥ .tag <message>
 │┃➥ .tagall
@@ -66,6 +63,7 @@ async function helpCommand(sock, chatId, message) {
 │┃➥ .update
 │┃➥ .settings
 │┃➥ .setpp <reply to image>
+│┃➥ .fullpp <reply to image>
 │┃➥ .autoreact <on/off>
 │┃➥ .autostatus <on/off>
 │┃➥ .autostatus react <on/off>
@@ -76,6 +74,9 @@ async function helpCommand(sock, chatId, message) {
 │┃➥ .pmblocker setmsg <text>
 │┃➥ .setmention <reply to msg>
 │┃➥ .mention <on/off>
+│┃➥ .rentbot <number>
+│┃➥ .rentbot stop <authId>
+│┃➥ .rentbot list
 ╰═════Aɴᴅʏ-Tᴇᴄʜ❦══════❏
 
 ╭════〔 🎨 *Image/Sticker Commands* 〕═══❏
@@ -103,15 +104,39 @@ async function helpCommand(sock, chatId, message) {
 ╰═════Aɴᴅʏ-Tᴇᴄʜ❦══════❏
 
 ╭════〔 🎮 *Game Commands* 〕═══❏
-│┃➥ .ttt @user
+│┃➥ .ttt / .ttt start
 │┃➥ .ttt join
-│┃➥ .ttt stop /.ttt surrender
+│┃➥ .ttt @user
+│┃➥ .ttt surrender
+│┃➥ .ttt stop
 │┃➥ .hangman
 │┃➥ .guess <letter>
 │┃➥ .trivia
 │┃➥ .answer <answer>
 │┃➥ .truth
 │┃➥ .dare
+╰═════Aɴᴅʏ-Tᴇᴄʜ❦══════❏
+
+╭════〔 💰 *Economy Commands* 〕═══❏
+│┃➥ .start or .register
+│┃➥ .balance or .bal
+│┃➥ .deposit <amount> or .dep all
+│┃➥ .withdraw <amount> or .with all
+│┃➥ .daily
+│┃➥ .weekly
+│┃➥ .work
+│┃➥ .beg
+│┃➥ .crime
+│┃➥ .search
+│┃➥ .fish
+│┃➥ .hunt
+│┃➥ .slots <amount>
+│┃➥ .blackjack <amount>
+│┃➥ .rob @user
+│┃➥ .shop
+│┃➥ .buy <item id>
+│┃➥ .inventory or .inv
+│┃➥ .leaderboard or .lb
 ╰═════Aɴᴅʏ-Tᴇᴄʜ❦══════❏
 
 ╭════〔 🤖 *AI Commands* 〕═══❏
@@ -204,7 +229,17 @@ async function helpCommand(sock, chatId, message) {
 │┃➥ .script
 │┃➥ .repo
 ╰═════Aɴᴅʏ-Tᴇᴄʜ❦══════❏
+`;
 
+    // Count commands automatically from the lines above (each line starting with │┃➥)
+    const totalCommands = (commandSections.match(/│┃➥/g) || []).length;
+
+    const helpMessage = `
+╭════〔 🏔️ *ANDY-XMD V2* 🏔️ 〕═══❏
+│┃➥ *Inspired by the fear of being average*
+│┃➥ *Total Commands:* ${totalCommands}
+╰═════Aɴᴅʏ-Tᴇᴄʜ❦══════❏
+${commandSections}
 Join our channel for updates:`;
 
     try {

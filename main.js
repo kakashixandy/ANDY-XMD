@@ -63,6 +63,7 @@ const { handleMentionDetection, mentionToggleCommand, setMentionCommand } = requ
 const memeCommand = require('./commands/meme');
 const tagCommand = require('./commands/tag');
 const tagNotAdminCommand = require('./commands/tagnotadmin');
+const economy = require('./commands/economy');
 const hideTagCommand = require('./commands/hidetag');
 const jokeCommand = require('./commands/joke');
 const quoteCommand = require('./commands/quote');
@@ -797,6 +798,7 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 }
                 await groupInfoCommand(sock, chatId, message);
                 break;
+                
             case userMessage === '.resetlink' || userMessage === '.revoke' || userMessage === '.anularlink':
                 if (!isGroup) {
                     await sock.sendMessage(chatId, { text: 'This command can only be used in groups!', ...channelInfo }, { quoted: message });
@@ -948,7 +950,75 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 const qMessage = message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
                 await shazamCommand(sock, chatId, message, qMessage);
                 break;
-                
+               case userMessage === '.start' || userMessage === '.register':
+    await economy.startCommand(sock, chatId, message, senderId);
+    break;
+case userMessage === '.balance' || userMessage === '.bal':
+    await economy.balanceCommand(sock, chatId, message, senderId);
+    break;
+case userMessage.startsWith('.deposit') || userMessage.startsWith('.dep'): {
+    const depArgs = userMessage.split(' ').slice(1).join(' ');
+    await economy.depositCommand(sock, chatId, message, senderId, depArgs);
+    break;
+}
+case userMessage.startsWith('.withdraw') || userMessage.startsWith('.with'): {
+    const withArgs = userMessage.split(' ').slice(1).join(' ');
+    await economy.withdrawCommand(sock, chatId, message, senderId, withArgs);
+    break;
+}
+case userMessage === '.daily':
+    await economy.dailyCommand(sock, chatId, message, senderId);
+    break;
+case userMessage === '.weekly':
+    await economy.weeklyCommand(sock, chatId, message, senderId);
+    break;
+case userMessage === '.work':
+    await economy.workCommand(sock, chatId, message, senderId);
+    break;
+case userMessage === '.beg':
+    await economy.begCommand(sock, chatId, message, senderId);
+    break;
+case userMessage === '.crime':
+    await economy.crimeCommand(sock, chatId, message, senderId);
+    break;
+case userMessage === '.search':
+    await economy.searchCommand(sock, chatId, message, senderId);
+    break;
+case userMessage === '.fish':
+    await economy.fishCommand(sock, chatId, message, senderId);
+    break;
+case userMessage === '.hunt':
+    await economy.huntCommand(sock, chatId, message, senderId);
+    break;
+case userMessage.startsWith('.slots'): {
+    const slotsArgs = userMessage.split(' ').slice(1).join(' ');
+    await economy.slotsCommand(sock, chatId, message, senderId, slotsArgs);
+    break;
+}
+case userMessage.startsWith('.blackjack') || userMessage.startsWith('.bj'): {
+    const bjArgs = userMessage.split(' ').slice(1).join(' ');
+    await economy.blackjackCommand(sock, chatId, message, senderId, bjArgs);
+    break;
+}
+case userMessage.startsWith('.rob'): {
+    const robMentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    await economy.robCommand(sock, chatId, message, senderId, robMentioned);
+    break;
+}
+case userMessage === '.shop':
+    await economy.shopCommand(sock, chatId, message);
+    break;
+case userMessage.startsWith('.buy'): {
+    const buyArgs = userMessage.split(' ').slice(1).join(' ');
+    await economy.buyCommand(sock, chatId, message, senderId, buyArgs);
+    break;
+}
+case userMessage === '.inventory' || userMessage === '.inv':
+    await economy.inventoryCommand(sock, chatId, message, senderId);
+    break;
+case userMessage === '.leaderboard' || userMessage === '.lb':
+    await economy.leaderboardCommand(sock, chatId, message);
+    break;
             case userMessage.startsWith('.translate') || userMessage.startsWith('.trt'):
                 const commandLength = userMessage.startsWith('.translate') ? 10 : 4;
                 await handleTranslateCommand(sock, chatId, message, userMessage.slice(commandLength));

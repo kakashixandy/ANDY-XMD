@@ -11,7 +11,7 @@ const pendingLoans = new Map(); // id -> { type: 'borrow'|'lend', from, to, amou
 
 const STARTING_BALANCE = 200000;
 const LOAN_INTEREST = 0.10;              // 10% flat interest
-const LOAN_DURATION = 7 * 60 * 60 * 1000; // 7 hours to repay
+const LOAN_DURATION = 1 * 60 * 60 * 1000; // 7 hours to repay
 const POLICE_FEE_RATE = 0.10;             // police charges = 10% of the remaining debt
 const POLICE_FEE_MIN = 500;               // ...but never less than this
 const SUE_COOLDOWN = 60 * 60 * 1000;      // a lender can sue the same debt once per hour
@@ -43,11 +43,74 @@ function normalizeJid(jid) {
     return `${user.split(':')[0]}@${server}`; // strips device suffix like ":12"
 }
 
+/* ---- Identity aliases: the same person can appear as 123@s.whatsapp.net OR 456@lid ---- */
+const aliases = new Map(); // any known jid form -> canonical jid (phone number form preferred)
+
+const isPn = (j) => typeof j === 'string' && j.endsWith('@s.whatsapp.net');
+
+function resolve(jid) {
+    jid = normalizeJid(jid);
+    let guard = 0;
+    while (aliases.has(jid) && guard++ < 5) jid = aliases.get(jid);
+    return jid;
+}
+
+// Move an account (and every reference to it) from one id to another
+function rekey(oldJid, newJid) {
+    if (!oldJid || oldJid === newJid) return;
+    const oldAcc = accounts.get(oldJid);
+    const newAcc = accounts.get(newJid);
+    if (oldAcc) {
+        // if both exist, keep the richer one
+        if (!newAcc || (oldAcc.wallet + oldAcc.bank) > (newAcc.wallet + newAcc.bank)) {
+            accounts.set(newJid, oldAcc);
+        }
+        accounts.delete(oldJid);
+    }
+    for (const acc of accounts.values()) {
+        if (acc.partner === oldJid) acc.partner = newJid;
+        for (const d of acc.debts) if (d.lender === oldJid) d.lender = newJid;
+    }
+    // keep pending requests pointing at the right person too
+    for (const [k, v] of [...pendingMarry]) {
+        if (k === oldJid || v.from === oldJid) {
+            pendingMarry.delete(k);
+            pendingMarry.set(k === oldJid ? newJid : k, { ...v, from: v.from === oldJid ? newJid : v.from });
+        }
+    }
+}
+
+// Tell the bot that these ids are the same person
+function learn(...ids) {
+    const list = [...new Set(ids
+        .filter(x => typeof x === 'string' && x.includes('@'))
+        .map(normalizeJid))];
+    if (list.length < 2) return;
+
+    const resolved = list.map(resolve);
+    const canonical = resolved.find(isPn) || resolved[0];
+
+    let changed = false;
+    for (let i = 0; i < list.length; i++) {
+        for (const id of [list[i], resolved[i]]) {
+            if (id !== canonical) {
+                if (aliases.get(id) !== canonical) changed = true;
+                aliases.set(id, canonical);
+                rekey(id, canonical);
+            }
+        }
+    }
+    if (changed) saveSoon();
+}
+
 function loadData() {
     try {
         if (!fs.existsSync(DATA_FILE)) return;
-        const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+        const file = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+        const raw = file.accounts || file; // old format was a flat jid -> account object
+        for (const [a, b] of Object.entries(file.aliases || {})) aliases.set(a, b);
         for (const [jid, acc] of Object.entries(raw)) {
+            if (jid === 'accounts' || jid === 'aliases') continue;
             accounts.set(jid, {
                 wallet: acc.wallet ?? 0,
                 bank: acc.bank ?? 0,
@@ -70,7 +133,10 @@ function saveSoon() {
         saveTimer = null;
         try {
             fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-            fs.writeFileSync(DATA_FILE, JSON.stringify(Object.fromEntries(accounts)));
+            fs.writeFileSync(DATA_FILE, JSON.stringify({
+                accounts: Object.fromEntries(accounts),
+                aliases: Object.fromEntries(aliases),
+            }));
         } catch (e) {
             console.error('Failed to save economy data:', e);
         }
@@ -80,7 +146,7 @@ function saveSoon() {
 loadData();
 
 function getAccount(jid) {
-    jid = normalizeJid(jid);
+    jid = resolve(jid);
     if (!accounts.has(jid)) {
         accounts.set(jid, {
             wallet: STARTING_BALANCE,
@@ -96,7 +162,7 @@ function getAccount(jid) {
 }
 
 function hasAccount(jid) {
-    return accounts.has(normalizeJid(jid));
+    return accounts.has(resolve(jid));
 }
 
 function getBalance(jid) {
@@ -150,14 +216,6 @@ async function replyMention(sock, chatId, message, text, mentions) {
     await sock.sendMessage(chatId, { text, mentions }, { quoted: message });
 }
 
-async function requireAccount(sock, chatId, message, senderId) {
-    if (!hasAccount(senderId)) {
-        await reply(sock, chatId, message, '❌ You don\'t have an account yet. Type *.start* to get your first *200,000 coins*!');
-        return false;
-    }
-    return true;
-}
-
 async function requireCooldown(sock, chatId, message, senderId, key, label) {
     const remaining = onCooldown(senderId, key);
     if (remaining > 0) {
@@ -183,20 +241,9 @@ function cleanExpired() {
 
 async function startCommand(sock, chatId, message, senderId) {
     try {
-        if (hasAccount(senderId)) {
-            const acc = getAccount(senderId);
-            await reply(sock, chatId, message,
-                `ℹ️ You already have an account!\n💰 Wallet: *${fmt(acc.wallet)}*\n🏦 Bank: *${fmt(acc.bank)}*`);
-            return;
-        }
-
-        getAccount(senderId); // creates with starting balance
-
+        const acc = getAccount(senderId);
         await reply(sock, chatId, message,
-            `🎉 *Welcome to the economy!*\n\n💰 You've been given *${fmt(STARTING_BALANCE)} coins* to start.\n` +
-            `🌍 Your account works in *every chat*.\n\n` +
-            `Type *.balance* to check your coins, or *.shop* to see what you can buy.`);
-
+            `🏦 *ANDY XMD BANK*\n\n💰 Wallet: *$${fmt(acc.wallet)}*\n🏦 Bank: *$${fmt(acc.bank)}*`);
     } catch (error) {
         console.error('Error in start command:', error);
         await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
@@ -205,12 +252,9 @@ async function startCommand(sock, chatId, message, senderId) {
 
 async function balanceCommand(sock, chatId, message, senderId) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const acc = getAccount(senderId);
         await reply(sock, chatId, message,
-            `💰 *Wallet:* ${fmt(acc.wallet)}\n🏦 *Bank:* ${fmt(acc.bank)}\n💵 *Net Worth:* ${fmt(acc.wallet + acc.bank)}`);
-
+            `🏦 *ANDY XMD BANK*\n\n💰 *Wallet:* $${fmt(acc.wallet)}\n🏦 *Bank:* $${fmt(acc.bank)}\n💵 *Net Worth:* $${fmt(acc.wallet + acc.bank)}`);
     } catch (error) {
         console.error('Error in balance command:', error);
         await reply(sock, chatId, message, '❌ Something went wrong. Please try again.');
@@ -221,20 +265,12 @@ async function balanceCommand(sock, chatId, message, senderId) {
 
 async function profileCommand(sock, chatId, message, senderId, mentionedJid = []) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const targetJid = (mentionedJid && mentionedJid[0]) || senderId;
-        if (!hasAccount(targetJid)) {
-            await reply(sock, chatId, message, '❌ That user doesn\'t have an account yet.');
-            return;
-        }
-
         const acc = getAccount(targetJid);
-        const isSelf = targetJid === senderId;
         const mentions = [targetJid];
 
-        let text = `👤 *Profile* — ${tag(targetJid)}\n\n`;
-        text += `💰 Wallet: *${fmt(acc.wallet)}*\n🏦 Bank: *${fmt(acc.bank)}*\n💵 Net Worth: *${fmt(acc.wallet + acc.bank)}*\n\n`;
+        let text = `👤 *ANDY XMD Profile* — ${tag(targetJid)}\n\n`;
+        text += `💰 Wallet: *$${fmt(acc.wallet)}*\n🏦 Bank: *$${fmt(acc.bank)}*\n💵 Net Worth: *$${fmt(acc.wallet + acc.bank)}*\n\n`;
 
         // Partner
         if (acc.partner) {
@@ -257,7 +293,7 @@ async function profileCommand(sock, chatId, message, senderId, mentionedJid = []
                 mentions.push(d.lender);
                 const left = d.due - now;
                 const status = left > 0 ? `due in ${formatTime(left)}` : `⚠️ OVERDUE by ${formatTime(-left)}`;
-                text += `• ${fmt(d.owed)} to ${tag(d.lender)} — ${status}\n`;
+                text += `• $${fmt(d.owed)} to ${tag(d.lender)} — ${status}\n`;
             }
             text += '\n';
         } else {
@@ -265,10 +301,11 @@ async function profileCommand(sock, chatId, message, senderId, mentionedJid = []
         }
 
         // Receivables (what others owe them)
+        const resolvedTarget = resolve(targetJid);
         const receivables = [];
         for (const [jid, other] of accounts) {
             for (const d of other.debts) {
-                if (d.lender === targetJid) receivables.push({ borrower: jid, ...d });
+                if (resolve(d.lender) === resolvedTarget) receivables.push({ borrower: jid, ...d });
             }
         }
         if (receivables.length) {
@@ -277,7 +314,7 @@ async function profileCommand(sock, chatId, message, senderId, mentionedJid = []
                 mentions.push(r.borrower);
                 const left = r.due - now;
                 const status = left > 0 ? `due in ${formatTime(left)}` : `⚠️ OVERDUE`;
-                text += `• ${tag(r.borrower)} owes ${fmt(r.owed)} — ${status}\n`;
+                text += `• ${tag(r.borrower)} owes $${fmt(r.owed)} — ${status}\n`;
             }
             text += '\n';
         }
@@ -302,8 +339,6 @@ async function profileCommand(sock, chatId, message, senderId, mentionedJid = []
 
 async function depositCommand(sock, chatId, message, senderId, args) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const acc = getAccount(senderId);
         const input = (args || '').trim().toLowerCase();
 
@@ -320,7 +355,7 @@ async function depositCommand(sock, chatId, message, senderId, args) {
         }
 
         if (amount > acc.wallet) {
-            await reply(sock, chatId, message, `❌ You only have *${fmt(acc.wallet)}* in your wallet.`);
+            await reply(sock, chatId, message, `❌ You only have *$${fmt(acc.wallet)}* in your wallet.`);
             return;
         }
 
@@ -328,7 +363,7 @@ async function depositCommand(sock, chatId, message, senderId, args) {
         acc.bank += amount;
 
         await reply(sock, chatId, message,
-            `✅ Deposited *${fmt(amount)}* coins.\n💰 Wallet: ${fmt(acc.wallet)}\n🏦 Bank: ${fmt(acc.bank)}`);
+            `✅ Deposited *$${fmt(amount)}*.\n💰 Wallet: $${fmt(acc.wallet)}\n🏦 Bank: $${fmt(acc.bank)}`);
 
     } catch (error) {
         console.error('Error in deposit command:', error);
@@ -338,8 +373,6 @@ async function depositCommand(sock, chatId, message, senderId, args) {
 
 async function withdrawCommand(sock, chatId, message, senderId, args) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const acc = getAccount(senderId);
         const input = (args || '').trim().toLowerCase();
 
@@ -356,7 +389,7 @@ async function withdrawCommand(sock, chatId, message, senderId, args) {
         }
 
         if (amount > acc.bank) {
-            await reply(sock, chatId, message, `❌ You only have *${fmt(acc.bank)}* in your bank.`);
+            await reply(sock, chatId, message, `❌ You only have *$${fmt(acc.bank)}* in your bank.`);
             return;
         }
 
@@ -364,7 +397,7 @@ async function withdrawCommand(sock, chatId, message, senderId, args) {
         acc.wallet += amount;
 
         await reply(sock, chatId, message,
-            `✅ Withdrew *${fmt(amount)}* coins.\n💰 Wallet: ${fmt(acc.wallet)}\n🏦 Bank: ${fmt(acc.bank)}`);
+            `✅ Withdrew *$${fmt(amount)}*.\n💰 Wallet: $${fmt(acc.wallet)}\n🏦 Bank: $${fmt(acc.bank)}`);
 
     } catch (error) {
         console.error('Error in withdraw command:', error);
@@ -376,14 +409,13 @@ async function withdrawCommand(sock, chatId, message, senderId, args) {
 
 async function dailyCommand(sock, chatId, message, senderId) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
         if (!(await requireCooldown(sock, chatId, message, senderId, 'daily', '.daily'))) return;
 
         const amount = 5000;
         getAccount(senderId).wallet += amount;
         setCooldown(senderId, 'daily');
 
-        await reply(sock, chatId, message, `☀️ *Daily claimed!*\n💰 +${fmt(amount)} coins`);
+        await reply(sock, chatId, message, `☀️ *Daily claimed!*\n💰 +$${fmt(amount)}`);
 
     } catch (error) {
         console.error('Error in daily command:', error);
@@ -393,14 +425,13 @@ async function dailyCommand(sock, chatId, message, senderId) {
 
 async function weeklyCommand(sock, chatId, message, senderId) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
         if (!(await requireCooldown(sock, chatId, message, senderId, 'weekly', '.weekly'))) return;
 
         const amount = 25000;
         getAccount(senderId).wallet += amount;
         setCooldown(senderId, 'weekly');
 
-        await reply(sock, chatId, message, `📅 *Weekly claimed!*\n💰 +${fmt(amount)} coins`);
+        await reply(sock, chatId, message, `📅 *Weekly claimed!*\n💰 +$${fmt(amount)}`);
 
     } catch (error) {
         console.error('Error in weekly command:', error);
@@ -410,7 +441,6 @@ async function weeklyCommand(sock, chatId, message, senderId) {
 
 async function workCommand(sock, chatId, message, senderId) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
         if (!(await requireCooldown(sock, chatId, message, senderId, 'work', '.work'))) return;
 
         const jobs = [
@@ -426,7 +456,7 @@ async function workCommand(sock, chatId, message, senderId) {
         getAccount(senderId).wallet += amount;
         setCooldown(senderId, 'work');
 
-        await reply(sock, chatId, message, `🛠️ You worked as a *${pick.job}* and earned *${fmt(amount)}* coins!`);
+        await reply(sock, chatId, message, `🛠️ You worked as a *${pick.job}* and earned *$${fmt(amount)}*!`);
 
     } catch (error) {
         console.error('Error in work command:', error);
@@ -436,7 +466,6 @@ async function workCommand(sock, chatId, message, senderId) {
 
 async function begCommand(sock, chatId, message, senderId) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
         if (!(await requireCooldown(sock, chatId, message, senderId, 'beg', '.beg'))) return;
 
         setCooldown(senderId, 'beg');
@@ -453,7 +482,7 @@ async function begCommand(sock, chatId, message, senderId) {
         const givers = ['a kind stranger', 'an old lady', 'a passing tourist', 'a generous businessman'];
         const giver = givers[Math.floor(Math.random() * givers.length)];
 
-        await reply(sock, chatId, message, `🙏 ${giver.charAt(0).toUpperCase() + giver.slice(1)} gave you *${fmt(amount)}* coins!`);
+        await reply(sock, chatId, message, `🙏 ${giver.charAt(0).toUpperCase() + giver.slice(1)} gave you *$${fmt(amount)}*!`);
 
     } catch (error) {
         console.error('Error in beg command:', error);
@@ -463,7 +492,6 @@ async function begCommand(sock, chatId, message, senderId) {
 
 async function crimeCommand(sock, chatId, message, senderId) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
         if (!(await requireCooldown(sock, chatId, message, senderId, 'crime', '.crime'))) return;
 
         setCooldown(senderId, 'crime');
@@ -476,12 +504,12 @@ async function crimeCommand(sock, chatId, message, senderId) {
         if (success) {
             const amount = Math.floor(Math.random() * 4000) + 1000;
             acc.wallet += amount;
-            await reply(sock, chatId, message, `🕵️ You ${crime} and got away with *${fmt(amount)}* coins!`);
+            await reply(sock, chatId, message, `🕵️ You ${crime} and got away with *$${fmt(amount)}*!`);
         } else {
             const fine = Math.floor(Math.random() * 1500) + 500;
             const actualFine = Math.min(fine, acc.wallet);
             acc.wallet -= actualFine;
-            await reply(sock, chatId, message, `🚔 You got caught trying to commit a crime and paid a fine of *${fmt(actualFine)}* coins!`);
+            await reply(sock, chatId, message, `🚔 You got caught trying to commit a crime and paid a fine of *$${fmt(actualFine)}*!`);
         }
 
     } catch (error) {
@@ -492,7 +520,6 @@ async function crimeCommand(sock, chatId, message, senderId) {
 
 async function searchCommand(sock, chatId, message, senderId) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
         if (!(await requireCooldown(sock, chatId, message, senderId, 'search', '.search'))) return;
 
         setCooldown(senderId, 'search');
@@ -509,7 +536,7 @@ async function searchCommand(sock, chatId, message, senderId) {
         const amount = Math.floor(Math.random() * 600) + 100;
         getAccount(senderId).wallet += amount;
 
-        await reply(sock, chatId, message, `🔍 You searched *${location}* and found *${fmt(amount)}* coins!`);
+        await reply(sock, chatId, message, `🔍 You searched *${location}* and found *$${fmt(amount)}*!`);
 
     } catch (error) {
         console.error('Error in search command:', error);
@@ -519,8 +546,6 @@ async function searchCommand(sock, chatId, message, senderId) {
 
 async function fishCommand(sock, chatId, message, senderId) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const acc = getAccount(senderId);
         if (!acc.inventory.fishingrod) {
             await reply(sock, chatId, message, '❌ You need a *Fishing Rod* to fish! Buy one with *.buy fishingrod*');
@@ -550,7 +575,7 @@ async function fishCommand(sock, chatId, message, senderId) {
         }
 
         acc.wallet += result.value;
-        await reply(sock, chatId, message, `🎣 You caught a *${result.name}* and sold it for *${fmt(result.value)}* coins!`);
+        await reply(sock, chatId, message, `🎣 You caught a *${result.name}* and sold it for *$${fmt(result.value)}*!`);
 
     } catch (error) {
         console.error('Error in fish command:', error);
@@ -560,8 +585,6 @@ async function fishCommand(sock, chatId, message, senderId) {
 
 async function huntCommand(sock, chatId, message, senderId) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const acc = getAccount(senderId);
         if (!acc.inventory.huntingrifle) {
             await reply(sock, chatId, message, '❌ You need a *Hunting Rifle* to hunt! Buy one with *.buy huntingrifle*');
@@ -591,7 +614,7 @@ async function huntCommand(sock, chatId, message, senderId) {
         }
 
         acc.wallet += result.value;
-        await reply(sock, chatId, message, `🔫 You hunted a *${result.name}* and sold it for *${fmt(result.value)}* coins!`);
+        await reply(sock, chatId, message, `🔫 You hunted a *${result.name}* and sold it for *$${fmt(result.value)}*!`);
 
     } catch (error) {
         console.error('Error in hunt command:', error);
@@ -603,8 +626,6 @@ async function huntCommand(sock, chatId, message, senderId) {
 
 async function slotsCommand(sock, chatId, message, senderId, args) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const acc = getAccount(senderId);
         const amount = parseInt((args || '').trim(), 10);
 
@@ -613,11 +634,11 @@ async function slotsCommand(sock, chatId, message, senderId, args) {
             return;
         }
         if (amount < 100 || amount > 10000) {
-            await reply(sock, chatId, message, '❌ Bet must be between *100* and *10,000* coins.');
+            await reply(sock, chatId, message, '❌ Bet must be between *$100* and *$10,000*.');
             return;
         }
         if (amount > acc.wallet) {
-            await reply(sock, chatId, message, `❌ You don't have *${fmt(amount)}* coins in your wallet.`);
+            await reply(sock, chatId, message, `❌ You don't have *$${fmt(amount)}* in your wallet.`);
             return;
         }
 
@@ -639,9 +660,9 @@ async function slotsCommand(sock, chatId, message, senderId, args) {
 
         const line = result.join(' | ');
         if (multiplier > 0) {
-            await reply(sock, chatId, message, `🎰 [ ${line} ]\n\n🎉 You won *${fmt(winnings)}* coins!`);
+            await reply(sock, chatId, message, `🎰 [ ${line} ]\n\n🎉 You won *$${fmt(winnings)}*!`);
         } else {
-            await reply(sock, chatId, message, `🎰 [ ${line} ]\n\n💸 You lost *${fmt(amount)}* coins.`);
+            await reply(sock, chatId, message, `🎰 [ ${line} ]\n\n💸 You lost *$${fmt(amount)}*.`);
         }
 
     } catch (error) {
@@ -652,8 +673,6 @@ async function slotsCommand(sock, chatId, message, senderId, args) {
 
 async function blackjackCommand(sock, chatId, message, senderId, args) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const acc = getAccount(senderId);
         const amount = parseInt((args || '').trim(), 10);
 
@@ -662,15 +681,14 @@ async function blackjackCommand(sock, chatId, message, senderId, args) {
             return;
         }
         if (amount < 100 || amount > 20000) {
-            await reply(sock, chatId, message, '❌ Bet must be between *100* and *20,000* coins.');
+            await reply(sock, chatId, message, '❌ Bet must be between *$100* and *$20,000*.');
             return;
         }
         if (amount > acc.wallet) {
-            await reply(sock, chatId, message, `❌ You don't have *${fmt(amount)}* coins in your wallet.`);
+            await reply(sock, chatId, message, `❌ You don't have *$${fmt(amount)}* in your wallet.`);
             return;
         }
 
-        // Simplified single-draw blackjack: draw cards until stand (auto-stand at 17+), dealer plays basic strategy
         const drawCard = () => Math.min(Math.floor(Math.random() * 13) + 1, 10);
 
         function drawHand(standAt) {
@@ -704,12 +722,12 @@ async function blackjackCommand(sock, chatId, message, senderId, args) {
         if (outcome === 'win') {
             const winnings = amount * 2;
             acc.wallet += winnings;
-            text += `🎉 You won *${fmt(winnings)}* coins!`;
+            text += `🎉 You won *$${fmt(winnings)}*!`;
         } else if (outcome === 'push') {
             acc.wallet += amount;
-            text += `🤝 Push — your bet of *${fmt(amount)}* coins was returned.`;
+            text += `🤝 Push — your bet of *$${fmt(amount)}* was returned.`;
         } else {
-            text += `💸 You lost *${fmt(amount)}* coins.`;
+            text += `💸 You lost *$${fmt(amount)}*.`;
         }
 
         await reply(sock, chatId, message, text);
@@ -724,20 +742,14 @@ async function blackjackCommand(sock, chatId, message, senderId, args) {
 
 async function robCommand(sock, chatId, message, senderId, mentionedJid = []) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         if (!mentionedJid || mentionedJid.length === 0) {
             await reply(sock, chatId, message, '*Usage:* .rob @user');
             return;
         }
 
         const targetJid = mentionedJid[0];
-        if (targetJid === senderId) {
+        if (resolve(targetJid) === resolve(senderId)) {
             await reply(sock, chatId, message, '❌ You cannot rob yourself.');
-            return;
-        }
-        if (!hasAccount(targetJid)) {
-            await reply(sock, chatId, message, '❌ That user doesn\'t have an account yet.');
             return;
         }
 
@@ -747,7 +759,7 @@ async function robCommand(sock, chatId, message, senderId, mentionedJid = []) {
         const target = getAccount(targetJid);
 
         if (target.wallet < 500) {
-            await reply(sock, chatId, message, '❌ That user doesn\'t have enough in their wallet to rob (minimum 500 coins).');
+            await reply(sock, chatId, message, '❌ That user doesn\'t have enough in their wallet to rob (minimum $500).');
             return;
         }
 
@@ -760,13 +772,13 @@ async function robCommand(sock, chatId, message, senderId, mentionedJid = []) {
             const stolen = Math.min(Math.floor(target.wallet * stealPercent), 10000);
             target.wallet -= stolen;
             robber.wallet += stolen;
-            await replyMention(sock, chatId, message, `🦹 You successfully robbed ${tag(targetJid)} and got away with *${fmt(stolen)}* coins!`, [targetJid]);
+            await replyMention(sock, chatId, message, `🦹 You successfully robbed ${tag(targetJid)} and got away with *$${fmt(stolen)}*!`, [targetJid]);
         } else {
             const fine = Math.min(Math.floor(robber.wallet * 0.15), 5000);
             const actualFine = Math.min(fine, robber.wallet);
             robber.wallet -= actualFine;
             target.wallet += actualFine;
-            await replyMention(sock, chatId, message, `🚨 You got caught trying to rob ${tag(targetJid)}! You paid a fine of *${fmt(actualFine)}* coins to them.`, [targetJid]);
+            await replyMention(sock, chatId, message, `🚨 You got caught trying to rob ${tag(targetJid)}! You paid a fine of *$${fmt(actualFine)}* to them.`, [targetJid]);
         }
 
     } catch (error) {
@@ -779,8 +791,6 @@ async function robCommand(sock, chatId, message, senderId, mentionedJid = []) {
 
 async function payCommand(sock, chatId, message, senderId, args, mentionedJid = []) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const amount = parseAmount(args);
         const targetJid = mentionedJid && mentionedJid[0];
 
@@ -788,18 +798,14 @@ async function payCommand(sock, chatId, message, senderId, args, mentionedJid = 
             await reply(sock, chatId, message, '*Usage:* .pay <amount> @user');
             return;
         }
-        if (targetJid === senderId) {
+        if (resolve(targetJid) === resolve(senderId)) {
             await reply(sock, chatId, message, '❌ You cannot pay yourself.');
-            return;
-        }
-        if (!hasAccount(targetJid)) {
-            await reply(sock, chatId, message, '❌ That user doesn\'t have an account yet.');
             return;
         }
 
         const acc = getAccount(senderId);
         if (amount > acc.wallet) {
-            await reply(sock, chatId, message, `❌ You only have *${fmt(acc.wallet)}* in your wallet.`);
+            await reply(sock, chatId, message, `❌ You only have *$${fmt(acc.wallet)}* in your wallet.`);
             return;
         }
 
@@ -807,7 +813,7 @@ async function payCommand(sock, chatId, message, senderId, args, mentionedJid = 
         getAccount(targetJid).wallet += amount;
 
         await replyMention(sock, chatId, message,
-            `💸 You paid *${fmt(amount)}* coins to ${tag(targetJid)}.\n💰 Wallet: ${fmt(acc.wallet)}`, [targetJid]);
+            `💸 You paid *$${fmt(amount)}* to ${tag(targetJid)}.\n💰 Wallet: $${fmt(acc.wallet)}`, [targetJid]);
 
     } catch (error) {
         console.error('Error in pay command:', error);
@@ -819,7 +825,6 @@ async function payCommand(sock, chatId, message, senderId, args, mentionedJid = 
 
 async function marryCommand(sock, chatId, message, senderId, mentionedJid = []) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
         cleanExpired();
 
         const targetJid = mentionedJid && mentionedJid[0];
@@ -827,12 +832,8 @@ async function marryCommand(sock, chatId, message, senderId, mentionedJid = []) 
             await reply(sock, chatId, message, '*Usage:* .marry @user');
             return;
         }
-        if (targetJid === senderId) {
+        if (resolve(targetJid) === resolve(senderId)) {
             await reply(sock, chatId, message, '❌ You cannot marry yourself.');
-            return;
-        }
-        if (!hasAccount(targetJid)) {
-            await reply(sock, chatId, message, '❌ That user doesn\'t have an account yet.');
             return;
         }
 
@@ -848,7 +849,7 @@ async function marryCommand(sock, chatId, message, senderId, mentionedJid = []) 
             return;
         }
 
-        pendingMarry.set(targetJid, { from: senderId, expires: Date.now() + REQUEST_TTL });
+        pendingMarry.set(resolve(targetJid), { from: resolve(senderId), expires: Date.now() + REQUEST_TTL });
 
         await replyMention(sock, chatId, message,
             `💍 ${tag(senderId)} has proposed to ${tag(targetJid)}!\n\n${tag(targetJid)}, type *.acceptmarry* within 5 minutes to say yes.`,
@@ -862,29 +863,29 @@ async function marryCommand(sock, chatId, message, senderId, mentionedJid = []) 
 
 async function acceptMarryCommand(sock, chatId, message, senderId) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
         cleanExpired();
 
-        const proposal = pendingMarry.get(senderId);
+        const me_id = resolve(senderId);
+        const proposal = pendingMarry.get(me_id);
         if (!proposal) {
             await reply(sock, chatId, message, '❌ You have no pending marriage proposals.');
             return;
         }
 
-        const proposerJid = proposal.from;
+        const proposerJid = resolve(proposal.from);
         const me = getAccount(senderId);
         const proposer = getAccount(proposerJid);
 
         if (me.partner || proposer.partner) {
-            pendingMarry.delete(senderId);
+            pendingMarry.delete(me_id);
             await reply(sock, chatId, message, '❌ One of you is already married.');
             return;
         }
 
         me.partner = proposerJid;
-        proposer.partner = senderId;
+        proposer.partner = me_id;
         me.marriedAt = proposer.marriedAt = Date.now();
-        pendingMarry.delete(senderId);
+        pendingMarry.delete(me_id);
 
         await replyMention(sock, chatId, message,
             `💒 *Congratulations!* ${tag(proposerJid)} and ${tag(senderId)} are now married! 🎉`,
@@ -898,8 +899,6 @@ async function acceptMarryCommand(sock, chatId, message, senderId) {
 
 async function divorceCommand(sock, chatId, message, senderId) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const me = getAccount(senderId);
         if (!me.partner) {
             await reply(sock, chatId, message, '❌ You\'re not married.');
@@ -927,13 +926,11 @@ async function divorceCommand(sock, chatId, message, senderId) {
 /* ===================== LOANS ===================== */
 
 function loanKey(type, from, to) {
-    return `${type}:${from}:${to}`;
+    return `${type}:${resolve(from)}:${resolve(to)}`;
 }
 
-// .borrow <amount> @lender  -> you ask someone to lend you money
 async function borrowCommand(sock, chatId, message, senderId, args, mentionedJid = []) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
         cleanExpired();
 
         const amount = parseAmount(args);
@@ -943,27 +940,23 @@ async function borrowCommand(sock, chatId, message, senderId, args, mentionedJid
             await reply(sock, chatId, message, '*Usage:* .borrow <amount> @user');
             return;
         }
-        if (lenderJid === senderId) {
+        if (resolve(lenderJid) === resolve(senderId)) {
             await reply(sock, chatId, message, '❌ You cannot borrow from yourself.');
             return;
         }
-        if (!hasAccount(lenderJid)) {
-            await reply(sock, chatId, message, '❌ That user doesn\'t have an account yet.');
-            return;
-        }
         if (amount < 100) {
-            await reply(sock, chatId, message, '❌ Minimum loan is *100* coins.');
+            await reply(sock, chatId, message, '❌ Minimum loan is *$100*.');
             return;
         }
 
         pendingLoans.set(loanKey('borrow', senderId, lenderJid), {
-            type: 'borrow', from: senderId, to: lenderJid, amount, expires: Date.now() + REQUEST_TTL
+            type: 'borrow', from: resolve(senderId), to: resolve(lenderJid), amount, expires: Date.now() + REQUEST_TTL
         });
 
         const owed = Math.ceil(amount * (1 + LOAN_INTEREST));
         await replyMention(sock, chatId, message,
-            `🏦 ${tag(senderId)} wants to borrow *${fmt(amount)}* coins from ${tag(lenderJid)}.\n` +
-            `📈 Interest: *${LOAN_INTEREST * 100}%* → repay *${fmt(owed)}* within *${formatTime(LOAN_DURATION)}*.\n\n` +
+            `🏦 ${tag(senderId)} wants to borrow *$${fmt(amount)}* from ${tag(lenderJid)}.\n` +
+            `📈 Interest: *${LOAN_INTEREST * 100}%* → repay *$${fmt(owed)}* within *${formatTime(LOAN_DURATION)}*.\n\n` +
             `${tag(lenderJid)}, type *.acceptborrow ${tag(senderId)}* to approve.`,
             [senderId, lenderJid]);
 
@@ -973,10 +966,8 @@ async function borrowCommand(sock, chatId, message, senderId, args, mentionedJid
     }
 }
 
-// .lend <amount> @borrower -> you offer to lend someone money
 async function lendCommand(sock, chatId, message, senderId, args, mentionedJid = []) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
         cleanExpired();
 
         const amount = parseAmount(args);
@@ -986,31 +977,27 @@ async function lendCommand(sock, chatId, message, senderId, args, mentionedJid =
             await reply(sock, chatId, message, '*Usage:* .lend <amount> @user');
             return;
         }
-        if (borrowerJid === senderId) {
+        if (resolve(borrowerJid) === resolve(senderId)) {
             await reply(sock, chatId, message, '❌ You cannot lend to yourself.');
             return;
         }
-        if (!hasAccount(borrowerJid)) {
-            await reply(sock, chatId, message, '❌ That user doesn\'t have an account yet.');
-            return;
-        }
         if (amount < 100) {
-            await reply(sock, chatId, message, '❌ Minimum loan is *100* coins.');
+            await reply(sock, chatId, message, '❌ Minimum loan is *$100*.');
             return;
         }
         if (amount > getAccount(senderId).wallet) {
-            await reply(sock, chatId, message, `❌ You only have *${fmt(getAccount(senderId).wallet)}* in your wallet.`);
+            await reply(sock, chatId, message, `❌ You only have *$${fmt(getAccount(senderId).wallet)}* in your wallet.`);
             return;
         }
 
         pendingLoans.set(loanKey('lend', senderId, borrowerJid), {
-            type: 'lend', from: senderId, to: borrowerJid, amount, expires: Date.now() + REQUEST_TTL
+            type: 'lend', from: resolve(senderId), to: resolve(borrowerJid), amount, expires: Date.now() + REQUEST_TTL
         });
 
         const owed = Math.ceil(amount * (1 + LOAN_INTEREST));
         await replyMention(sock, chatId, message,
-            `🤝 ${tag(senderId)} offers to lend *${fmt(amount)}* coins to ${tag(borrowerJid)}.\n` +
-            `📈 Interest: *${LOAN_INTEREST * 100}%* → repay *${fmt(owed)}* within *${formatTime(LOAN_DURATION)}*.\n\n` +
+            `🤝 ${tag(senderId)} offers to lend *$${fmt(amount)}* to ${tag(borrowerJid)}.\n` +
+            `📈 Interest: *${LOAN_INTEREST * 100}%* → repay *$${fmt(owed)}* within *${formatTime(LOAN_DURATION)}*.\n\n` +
             `${tag(borrowerJid)}, type *.acceptborrow ${tag(senderId)}* to accept.`,
             [senderId, borrowerJid]);
 
@@ -1020,10 +1007,8 @@ async function lendCommand(sock, chatId, message, senderId, args, mentionedJid =
     }
 }
 
-// .acceptborrow @user -> accept a loan request (as lender) or a loan offer (as borrower)
 async function acceptBorrowCommand(sock, chatId, message, senderId, mentionedJid = []) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
         cleanExpired();
 
         const otherJid = mentionedJid && mentionedJid[0];
@@ -1032,7 +1017,6 @@ async function acceptBorrowCommand(sock, chatId, message, senderId, mentionedJid
             return;
         }
 
-        // Either they asked to borrow from me, or they offered to lend to me
         const keyBorrow = loanKey('borrow', otherJid, senderId);
         const keyLend = loanKey('lend', otherJid, senderId);
         const key = pendingLoans.has(keyBorrow) ? keyBorrow : (pendingLoans.has(keyLend) ? keyLend : null);
@@ -1051,7 +1035,7 @@ async function acceptBorrowCommand(sock, chatId, message, senderId, mentionedJid
 
         if (lender.wallet < req.amount) {
             pendingLoans.delete(key);
-            await replyMention(sock, chatId, message, `❌ ${tag(lenderJid)} no longer has *${fmt(req.amount)}* coins in their wallet.`, [lenderJid]);
+            await replyMention(sock, chatId, message, `❌ ${tag(lenderJid)} no longer has *$${fmt(req.amount)}* in their wallet.`, [lenderJid]);
             return;
         }
 
@@ -1059,7 +1043,7 @@ async function acceptBorrowCommand(sock, chatId, message, senderId, mentionedJid
         lender.wallet -= req.amount;
         borrower.wallet += req.amount;
         borrower.debts.push({
-            lender: lenderJid,
+            lender: resolve(lenderJid),
             principal: req.amount,
             owed,
             due: Date.now() + LOAN_DURATION,
@@ -1067,8 +1051,8 @@ async function acceptBorrowCommand(sock, chatId, message, senderId, mentionedJid
         pendingLoans.delete(key);
 
         await replyMention(sock, chatId, message,
-            `✅ *Loan approved!*\n${tag(lenderJid)} lent *${fmt(req.amount)}* coins to ${tag(borrowerJid)}.\n` +
-            `📉 ${tag(borrowerJid)} owes *${fmt(owed)}* coins (incl. ${LOAN_INTEREST * 100}% interest), due in *${formatTime(LOAN_DURATION)}*.\n\n` +
+            `✅ *Loan approved!*\n${tag(lenderJid)} lent *$${fmt(req.amount)}* to ${tag(borrowerJid)}.\n` +
+            `📉 ${tag(borrowerJid)} owes *$${fmt(owed)}* (incl. ${LOAN_INTEREST * 100}% interest), due in *${formatTime(LOAN_DURATION)}*.\n\n` +
             `Repay with *.repay <amount|all> @${lenderJid.split('@')[0]}*\n` +
             `⚠️ If it's late, the lender can *.sue* and the court will seize the money + police charges.`,
             [lenderJid, borrowerJid]);
@@ -1079,11 +1063,8 @@ async function acceptBorrowCommand(sock, chatId, message, senderId, mentionedJid
     }
 }
 
-// .repay @lender <amount|all>
 async function repayCommand(sock, chatId, message, senderId, args, mentionedJid = []) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const lenderJid = mentionedJid && mentionedJid[0];
         const parts = (args || '').trim().split(/\s+/);
         const wantsAll = parts.some(p => p.toLowerCase() === 'all');
@@ -1095,7 +1076,7 @@ async function repayCommand(sock, chatId, message, senderId, args, mentionedJid 
         }
 
         const me = getAccount(senderId);
-        const debt = me.debts.find(d => d.lender === lenderJid);
+        const debt = me.debts.find(d => resolve(d.lender) === resolve(lenderJid));
         if (!debt) {
             await reply(sock, chatId, message, '❌ You don\'t owe that user anything.');
             return;
@@ -1104,7 +1085,7 @@ async function repayCommand(sock, chatId, message, senderId, args, mentionedJid 
         let pay = wantsAll ? debt.owed : amountArg;
         pay = Math.min(pay, debt.owed, me.wallet);
         if (pay <= 0) {
-            await reply(sock, chatId, message, '❌ You don\'t have any coins in your wallet to repay with.');
+            await reply(sock, chatId, message, '❌ You don\'t have any money in your wallet to repay with.');
             return;
         }
 
@@ -1115,9 +1096,9 @@ async function repayCommand(sock, chatId, message, senderId, args, mentionedJid 
         let text;
         if (debt.owed <= 0) {
             me.debts.splice(me.debts.indexOf(debt), 1);
-            text = `✅ You repaid *${fmt(pay)}* coins to ${tag(lenderJid)}. Debt fully cleared! 🎉`;
+            text = `✅ You repaid *$${fmt(pay)}* to ${tag(lenderJid)}. Debt fully cleared! 🎉`;
         } else {
-            text = `💸 You repaid *${fmt(pay)}* coins to ${tag(lenderJid)}.\n📉 Remaining debt: *${fmt(debt.owed)}*`;
+            text = `💸 You repaid *$${fmt(pay)}* to ${tag(lenderJid)}.\n📉 Remaining debt: *$${fmt(debt.owed)}*`;
         }
 
         await replyMention(sock, chatId, message, text, [lenderJid]);
@@ -1128,27 +1109,20 @@ async function repayCommand(sock, chatId, message, senderId, args, mentionedJid 
     }
 }
 
-// .sue @borrower -> force repayment of an OVERDUE loan (debt + police charges)
 async function sueCommand(sock, chatId, message, senderId, mentionedJid = []) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const borrowerJid = mentionedJid && mentionedJid[0];
         if (!borrowerJid) {
             await reply(sock, chatId, message, '*Usage:* .sue @user');
             return;
         }
-        if (borrowerJid === senderId) {
+        if (resolve(borrowerJid) === resolve(senderId)) {
             await reply(sock, chatId, message, '❌ You cannot sue yourself.');
-            return;
-        }
-        if (!hasAccount(borrowerJid)) {
-            await reply(sock, chatId, message, '❌ That user doesn\'t have an account.');
             return;
         }
 
         const borrower = getAccount(borrowerJid);
-        const debt = borrower.debts.find(d => d.lender === senderId);
+        const debt = borrower.debts.find(d => resolve(d.lender) === resolve(senderId));
         if (!debt) {
             await replyMention(sock, chatId, message, `❌ ${tag(borrowerJid)} doesn't owe you anything.`, [borrowerJid]);
             return;
@@ -1170,7 +1144,6 @@ async function sueCommand(sock, chatId, message, senderId, mentionedJid = []) {
         const policeFee = Math.max(POLICE_FEE_MIN, Math.ceil(debt.owed * POLICE_FEE_RATE));
         const totalDue = debt.owed + policeFee;
 
-        // Seize from wallet first, then bank (a Lockbox protects 20% of the bank)
         const bankSeizable = Math.floor(borrower.bank * (borrower.inventory.lockbox ? 0.8 : 1));
         const fromWallet = Math.min(borrower.wallet, totalDue);
         const fromBank = Math.min(bankSeizable, totalDue - fromWallet);
@@ -1179,7 +1152,6 @@ async function sueCommand(sock, chatId, message, senderId, mentionedJid = []) {
         borrower.wallet -= fromWallet;
         borrower.bank -= fromBank;
 
-        // Lender is paid first; whatever is left covers the police charges
         const toLender = Math.min(seized, debt.owed);
         const toPolice = seized - toLender;
         lender.wallet += toLender;
@@ -1187,16 +1159,16 @@ async function sueCommand(sock, chatId, message, senderId, mentionedJid = []) {
         debt.suedAt = now;
 
         let text = `⚖️ *COURT ORDER* ⚖️\n${tag(senderId)} sued ${tag(borrowerJid)} for an overdue loan.\n\n` +
-            `🚔 Police charges: *${fmt(policeFee)}*\n` +
-            `💰 Seized: *${fmt(seized)}* of *${fmt(totalDue)}* (wallet ${fmt(fromWallet)}, bank ${fmt(fromBank)})\n` +
-            `📥 Paid to ${tag(senderId)}: *${fmt(toLender)}*\n` +
-            `👮 Paid to police: *${fmt(toPolice)}*\n`;
+            `🚔 Police charges: *$${fmt(policeFee)}*\n` +
+            `💰 Seized: *$${fmt(seized)}* of *$${fmt(totalDue)}* (wallet $${fmt(fromWallet)}, bank $${fmt(fromBank)})\n` +
+            `📥 Paid to ${tag(senderId)}: *$${fmt(toLender)}*\n` +
+            `👮 Paid to police: *$${fmt(toPolice)}*\n`;
 
         if (debt.owed <= 0) {
             borrower.debts.splice(borrower.debts.indexOf(debt), 1);
             text += `\n✅ Debt fully cleared.`;
         } else {
-            text += `\n📉 ${tag(borrowerJid)} still owes *${fmt(debt.owed)}* (not enough funds to seize). You can sue again in ${formatTime(SUE_COOLDOWN)}.`;
+            text += `\n📉 ${tag(borrowerJid)} still owes *$${fmt(debt.owed)}* (not enough funds to seize). You can sue again in ${formatTime(SUE_COOLDOWN)}.`;
         }
 
         await replyMention(sock, chatId, message, text, [senderId, borrowerJid]);
@@ -1211,9 +1183,9 @@ async function sueCommand(sock, chatId, message, senderId, mentionedJid = []) {
 
 async function shopCommand(sock, chatId, message) {
     try {
-        let text = '🛒 *Shop*\n\n';
+        let text = '🛒 *ANDY XMD Shop*\n\n';
         for (const [id, item] of Object.entries(SHOP_ITEMS)) {
-            text += `*${item.name}* — ${fmt(item.price)} coins\n_${item.desc}_\nID: \`${id}\`\n\n`;
+            text += `*${item.name}* — $${fmt(item.price)}\n_${item.desc}_\nID: \`${id}\`\n\n`;
         }
         text += 'Buy with *.buy <item id>*';
         await reply(sock, chatId, message, text);
@@ -1225,8 +1197,6 @@ async function shopCommand(sock, chatId, message) {
 
 async function buyCommand(sock, chatId, message, senderId, args) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const itemId = (args || '').trim().toLowerCase();
         const item = SHOP_ITEMS[itemId];
 
@@ -1242,14 +1212,14 @@ async function buyCommand(sock, chatId, message, senderId, args) {
         }
 
         if (acc.wallet < item.price) {
-            await reply(sock, chatId, message, `❌ You need *${fmt(item.price)}* coins to buy this.`);
+            await reply(sock, chatId, message, `❌ You need *$${fmt(item.price)}* to buy this.`);
             return;
         }
 
         acc.wallet -= item.price;
         acc.inventory[itemId] = true;
 
-        await reply(sock, chatId, message, `✅ You bought *${item.name}* for *${fmt(item.price)}* coins!`);
+        await reply(sock, chatId, message, `✅ You bought *${item.name}* for *$${fmt(item.price)}*!`);
 
     } catch (error) {
         console.error('Error in buy command:', error);
@@ -1259,8 +1229,6 @@ async function buyCommand(sock, chatId, message, senderId, args) {
 
 async function inventoryCommand(sock, chatId, message, senderId) {
     try {
-        if (!(await requireAccount(sock, chatId, message, senderId))) return;
-
         const acc = getAccount(senderId);
         const owned = Object.keys(acc.inventory).filter(id => acc.inventory[id]);
 
@@ -1292,9 +1260,9 @@ async function leaderboardCommand(sock, chatId, message) {
             return;
         }
 
-        let text = '🏆 *Richest Users*\n\n';
+        let text = '🏆 *ANDY XMD Richest Users*\n\n';
         all.forEach((entry, i) => {
-            text += `${i + 1}. @${entry.jid.split('@')[0]} — ${fmt(entry.net)} coins\n`;
+            text += `${i + 1}. @${entry.jid.split('@')[0]} — $${fmt(entry.net)}\n`;
         });
 
         await sock.sendMessage(chatId, {
@@ -1310,14 +1278,11 @@ async function leaderboardCommand(sock, chatId, message) {
 
 /* ===================== EXPORTS ===================== */
 
-// Wraps every command so that:
-//  - the sender (and any @mentions) are normalized to ONE id per user → same account in every chat
-//  - data is saved to disk after each command
 function wrap(fn) {
     return async (...a) => {
-        if (a[3]) a[3] = normalizeJid(a[3]);
+        if (a[3]) a[3] = resolve(a[3]);
         for (let i = 4; i < a.length; i++) {
-            if (Array.isArray(a[i])) a[i] = a[i].map(normalizeJid);
+            if (Array.isArray(a[i])) a[i] = a[i].map(resolve);
         }
         const result = await fn(...a);
         saveSoon();
@@ -1355,6 +1320,8 @@ module.exports = {
     buyCommand: wrap(buyCommand),
     inventoryCommand: wrap(inventoryCommand),
     leaderboardCommand: wrap(leaderboardCommand),
+    learn,
+    resolve,
     getBalance,
     setBalance
 };

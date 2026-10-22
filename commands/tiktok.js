@@ -1,161 +1,69 @@
-const axios = require("axios");
+// TikTok downloader (no watermark) using the free TikWM API.
+// Needs Node 18+ (built-in fetch). No API key required.
 
-const API_URL = "https://anabot.my.id/api/download/tiktok";
-const API_KEY = "freeApikey";
+const TIKWM = 'https://www.tikwm.com';
 
-async function tiktokDownloader(url) {
-    try {
-        const response = await axios.get(API_URL, {
-            params: {
-                url: url,
-                apikey: API_KEY
-            },
-            timeout: 45000,
-            headers: {
-                "User-Agent": "Mozilla/5.0"
-            }
-        });
-
-        return response.data;
-    } catch (error) {
-        console.error(
-            "TikTok API Error:",
-            error.response?.data || error.message
-        );
-
-        throw error;
-    }
+function fullUrl(u) {
+    if (!u) return null;
+    return u.startsWith('http') ? u : `${TIKWM}${u}`;
 }
 
 async function tiktokCommand(sock, chatId, message) {
-    const text =
+    const rawText =
         message.message?.conversation ||
-        message.message?.extendedTextMessage?.text;
+        message.message?.extendedTextMessage?.text ||
+        '';
+    const link = rawText.trim().split(/\s+/)[1];
 
-    if (!text) {
-        return await sock.sendMessage(chatId, {
-            text: "Please provide a TikTok link for the video."
-        });
-    }
-
-    const url = text.split(" ").slice(1).join(" ").trim();
-
-    if (!url) {
-        return await sock.sendMessage(chatId, {
-            text: "Please provide a TikTok link for the video."
-        });
-    }
-
-    const tiktokPatterns = [
-        /https?:\/\/(?:www\.)?tiktok\.com\//i,
-        /https?:\/\/(?:vm\.)?tiktok\.com\//i,
-        /https?:\/\/(?:vt\.)?tiktok\.com\//i
-    ];
-
-    const isValidUrl = tiktokPatterns.some(pattern =>
-        pattern.test(url)
-    );
-
-    if (!isValidUrl) {
-        return await sock.sendMessage(chatId, {
-            text: "That is not a valid TikTok link. Please provide a valid TikTok video link."
-        });
+    if (!link || !/tiktok\.com/i.test(link)) {
+        await sock.sendMessage(chatId, {
+            text: '❌ *Usage:* .tiktok <TikTok link>'
+        }, { quoted: message });
+        return;
     }
 
     try {
-        await sock.sendMessage(
-            chatId,
-            {
-                text: "⏳ Downloading TikTok video..."
-            },
-            { quoted: message }
-        );
+        await sock.sendMessage(chatId, { react: { text: '⏳', key: message.key } });
 
-        const apiData = await tiktokDownloader(url);
-
-        console.log(
-            "TikTok API Response:",
-            JSON.stringify(apiData, null, 2)
-        );
-
-        const result = apiData?.result || apiData?.data?.result;
-
-        if (!result) {
-            throw new Error("Invalid API response");
-        }
-
-        const videoUrl =
-            result.nowatermark ||
-            result.video;
-
-        if (!videoUrl) {
-            throw new Error("No downloadable video found");
-        }
-
-        // Download video as buffer
-        const videoResponse = await axios.get(videoUrl, {
-            responseType: "arraybuffer",
-            timeout: 90000,
-            headers: {
-                "User-Agent": "Mozilla/5.0"
-            }
+        const res = await fetch(`${TIKWM}/api/?url=${encodeURIComponent(link)}&hd=1`, {
+            headers: { 'User-Agent': 'Mozilla/5.0' }
         });
+        const json = await res.json();
 
-        const videoBuffer = Buffer.from(videoResponse.data);
-
-        const username =
-            result.username ||
-            result.author?.username ||
-            result.author?.nickname ||
-            "Unknown";
-
-        const description =
-            result.description ||
-            result.title ||
-            "No caption";
-
-        const caption = `🎵 ANDY-XMD TIKTOK *
-━━━━━━━━━━━━━━━━━━━
-
-👤 *User:* ${username}
-
-📝 *Caption:*
-${description}
-
-✨ *Quality:* ${
-            result.nowatermark
-                ? "No Watermark"
-                : "Standard"
+        if (json.code !== 0 || !json.data) {
+            throw new Error(json.msg || 'Could not fetch this video');
         }
 
-━━━━━━━━━━━━━━━━━━━`;
+        const d = json.data;
+        const caption =
+            `🎵 *TikTok Downloader*\n\n` +
+            `👤 ${d.author?.nickname || d.author?.unique_id || 'Unknown'}\n` +
+            `📝 ${(d.title || '').slice(0, 200)}\n` +
+            `❤️ ${d.digg_count ?? '-'}   👁️ ${d.play_count ?? '-'}`;
 
-        await sock.sendMessage(
-            chatId,
-            {
-                video: videoBuffer,
-                mimetype: "video/mp4",
-                caption: caption,
-                fileName: `tiktok_${username.replace(
-                    /[^a-zA-Z0-9_-]/g,
-                    ""
-                )}.mp4`
-            },
-            { quoted: message }
-        );
+        if (Array.isArray(d.images) && d.images.length) {
+            // Slideshow post: send up to 5 images
+            for (const img of d.images.slice(0, 5)) {
+                await sock.sendMessage(chatId, { image: { url: img } }, { quoted: message });
+            }
+            await sock.sendMessage(chatId, { text: caption }, { quoted: message });
+        } else {
+            const videoUrl = fullUrl(d.hdplay || d.play);
+            if (!videoUrl) throw new Error('No video link returned');
 
+            await sock.sendMessage(chatId, {
+                video: { url: videoUrl },
+                caption
+            }, { quoted: message });
+        }
+
+        await sock.sendMessage(chatId, { react: { text: '✅', key: message.key } });
     } catch (error) {
-        console.error("TikTok command error:", error);
-
-        await sock.sendMessage(
-            chatId,
-            {
-                text:
-                    `❌ Failed to download TikTok video.\n` +
-                    `Reason: ${error.message}`
-            },
-            { quoted: message }
-        );
+        console.error('[TIKTOK] failed:', error?.stack || error);
+        await sock.sendMessage(chatId, { react: { text: '❌', key: message.key } });
+        await sock.sendMessage(chatId, {
+            text: `❌ Download failed: ${error.message || 'Try again later.'}`
+        }, { quoted: message });
     }
 }
 

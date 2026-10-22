@@ -25,6 +25,8 @@ async function helpCommand(sock, chatId, message) {
 │┃➥ .ss <link>
 │┃➥ .jid
 │┃➥ .url
+│┃➥ .qr 
+│┃➥ .readqr
 ╰═════Aɴᴅʏ-Tᴇᴄʜ❦══════❏
 
 ╭════〔 👮‍♂️ *Admin Commands* 〕═══❏
@@ -74,9 +76,6 @@ async function helpCommand(sock, chatId, message) {
 │┃➥ .pmblocker setmsg <text>
 │┃➥ .setmention <reply to msg>
 │┃➥ .mention <on/off>
-│┃➥ .rentbot <number>
-│┃➥ .rentbot stop <authId>
-│┃➥ .rentbot list
 ╰═════Aɴᴅʏ-Tᴇᴄʜ❦══════❏
 
 ╭════〔 🎨 *Image/Sticker Commands* 〕═══❏
@@ -116,6 +115,7 @@ async function helpCommand(sock, chatId, message) {
 │┃➥ .truth
 │┃➥ .dare
 ╰═════Aɴᴅʏ-Tᴇᴄʜ❦══════❏
+
 ╭════〔 💰 *Economy Commands* 〕═══❏
 │┃➥ .start or .register
 │┃➥ .balance or .bal

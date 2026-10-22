@@ -1,4 +1,4 @@
-
+require('./patch-baileys');
 require('./settings')
 const { Boom } = require('@hapi/boom')
 const fs = require('fs')
@@ -25,7 +25,7 @@ const {
     jidNormalizedUser,
     makeCacheableSignalKeyStore,
     delay
-} = require("@whiskeysockets/baileys")
+} = require("andy")
 const NodeCache = require("node-cache")
 // Using a lightweight persisted store instead of makeInMemoryStore (compat across versions)
 const pino = require("pino")

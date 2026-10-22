@@ -53,6 +53,7 @@ const warnCommand = require('./commands/warn');
 const warningsCommand = require('./commands/warnings');
 const ttsCommand = require('./commands/tts');
 const { tictactoeCommand, handleTicTacToeMove } = require('./commands/tictactoe');
+const { qrCommand, readQrCommand } = require('./commands/qr');
 const { incrementMessageCount, topMembers } = require('./commands/topmembers');
 const ownerCommand = require('./commands/owner');
 const deleteCommand = require('./commands/delete');
@@ -78,7 +79,8 @@ const { startTrivia, answerTrivia } = require('./commands/trivia');
 const { complimentCommand } = require('./commands/compliment');
 const { insultCommand } = require('./commands/insult');
 const { eightBallCommand } = require('./commands/eightball');
-const { lyricsCommand } = require('./commands/lyrics');
+const  lyricsCommand  = require('./commands/lyrics');
+const gcstoryCommand = require('./commands/gcstory');
 const { dareCommand } = require('./commands/dare');
 const { truthCommand } = require('./commands/truth');
 const { clearCommand } = require('./commands/clear');
@@ -642,6 +644,10 @@ async function handleMessages(sock, messageUpdate, printLog) {
                 const songTitle = userMessage.split(' ').slice(1).join(' ');
                 await lyricsCommand(sock, chatId, songTitle, message);
                 break;
+                case userMessage.startsWith('.gcstory'):   
+                const xmdMessage = message.message?.extendedTextMessage?.contextInfo?.quotedMessage;   
+                await gcstoryCommand(sock, chatId, message, xmdMessage);
+                break;
             case userMessage.startsWith('.simp'):
                 const quotedMsg = message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
                 const mentionedJid = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
@@ -673,6 +679,12 @@ async function handleMessages(sock, messageUpdate, printLog) {
             case userMessage === '.ping':
                 await pingCommand(sock, chatId, message);
                 break;
+                case userMessage === '.qr' || userMessage.startsWith('.qr ') || userMessage.startsWith('.qrcode'):
+    await qrCommand(sock, chatId, message, rawText);
+    break;
+case userMessage === '.readqr' || userMessage === '.scanqr':
+    await readQrCommand(sock, chatId, message);
+    break;
             case userMessage === '.alive':
                 await aliveCommand(sock, chatId, message);
                 break;

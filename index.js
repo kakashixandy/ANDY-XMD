@@ -25,7 +25,7 @@ const {
     jidNormalizedUser,
     makeCacheableSignalKeyStore,
     delay
-} = require("andy")
+} = require("@whiskeysockets/baileys")
 const NodeCache = require("node-cache")
 // Using a lightweight persisted store instead of makeInMemoryStore (compat across versions)
 const pino = require("pino")

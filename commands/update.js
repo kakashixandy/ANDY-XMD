@@ -1,228 +1,138 @@
-const { exec } = require('child_process');
+
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
+const { exec } = require('child_process');
 const settings = require('../settings');
-const isOwnerOrSudo = require('../lib/isOwner');
 
-// Reference bot's repository (source of updates)
-const REPO_OWNER = 'andytech580';
-const REPO_NAME = 'ANDY-XMD';
-const REPO_BRANCH = 'main';
-const REPO_GIT_URL = `https://github.com/${REPO_OWNER}/${REPO_NAME}.git`;
-const REPO_ZIP_URL = `https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REPO_BRANCH}.zip`;
+// Raw base link of your MAIN repo (must end with a slash)
+const MAIN_RAW = 'https://raw.githubusercontent.com/andytech580/ANDY-XMD/main/';
 
-function run(cmd) {
+// The bot runs from node_modules/xcache/..., the real project root is above node_modules
+const ROOT = __dirname.split(`${path.sep}node_modules`)[0];
+
+function normalize(jid = '') {
+    return String(jid).split('@')[0].split(':')[0].replace(/\D/g, '');
+}
+
+function isOwner(message, sock) {
+    const sender = normalize(message.key.participant || message.key.remoteJid);
+    const bot = normalize(sock.user?.id);
+    if (message.key.fromMe || sender === bot) return true;
+
+    const owners = []
+        .concat(settings.ownerNumber || settings.owner || [])
+        .flat()
+        .map(normalize)
+        .filter(Boolean);
+    return owners.includes(sender);
+}
+
+function run(cmd, cwd, timeoutMs) {
     return new Promise((resolve, reject) => {
-        exec(cmd, { windowsHide: true }, (err, stdout, stderr) => {
-            if (err) return reject(new Error((stderr || stdout || err.message || '').toString()));
-            resolve((stdout || '').toString());
+        exec(cmd, { cwd, timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+            if (err) reject(new Error((stderr || err.message).toString().slice(-300)));
+            else resolve(stdout);
         });
     });
 }
 
-async function hasGitRepo() {
-    const gitDir = path.join(process.cwd(), '.git');
-    if (!fs.existsSync(gitDir)) return false;
+async function fetchMain(file) {
+    return fetch(MAIN_RAW + file, { headers: { 'User-Agent': 'andy-xmd-update' } });
+}
+
+// Step 1: add missing packages. Returns the names that were added.
+async function syncDependencies() {
+    const res = await fetchMain('package.json');
+    if (!res.ok) throw new Error(`Could not read main package.json (HTTP ${res.status})`);
+    const remote = await res.json();
+
+    const localPath = path.join(ROOT, 'package.json');
+    const local = JSON.parse(fs.readFileSync(localPath, 'utf8'));
+    local.dependencies = local.dependencies || {};
+
+    const added = [];
+    for (const [name, version] of Object.entries(remote.dependencies || {})) {
+        if (!local.dependencies[name]) {
+            local.dependencies[name] = version;
+            added.push(name);
+        }
+    }
+
+    if (added.length) {
+        fs.writeFileSync(localPath, JSON.stringify(local, null, 2));
+        await run('npm install --omit=dev --no-audit --no-fund', ROOT, 5 * 60 * 1000);
+    }
+    return added;
+}
+
+// Step 2: replace the loader if the main repo has a newer one. Returns true if replaced.
+async function syncLoader() {
+    const res = await fetchMain('index.js');
+    if (res.status === 404) return false;
+    if (!res.ok) throw new Error(`Could not read main index.js (HTTP ${res.status})`);
+
+    const remote = await res.text();
+    if (remote.length < 200) throw new Error('main index.js looks empty, kept the old one');
+
+    const target = path.join(ROOT, 'index.js');
+    const current = fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : '';
+    if (current.replace(/\r\n/g, '\n') === remote.replace(/\r\n/g, '\n')) return false;
+
+    // Never install a broken loader: check the syntax first
+    const tmp = path.join(ROOT, 'index.new.js');
+    fs.writeFileSync(tmp, remote);
     try {
-        await run('git --version');
-        return true;
+        await run(`node --check "${tmp}"`, ROOT, 20000);
     } catch {
-        return false;
+        fs.unlinkSync(tmp);
+        throw new Error('new index.js failed the syntax check, kept the old one');
     }
-}
 
-async function updateViaGit() {
-    const oldRev = (await run('git rev-parse HEAD').catch(() => 'unknown')).trim();
-    // Fetch directly from the reference bot's repo instead of the configured origin
-    await run(`git fetch ${REPO_GIT_URL} ${REPO_BRANCH}`);
-    const newRev = (await run('git rev-parse FETCH_HEAD')).trim();
-    const alreadyUpToDate = oldRev === newRev;
-    const commits = alreadyUpToDate ? '' : await run(`git log --pretty=format:"%h %s (%an)" ${oldRev}..${newRev}`).catch(() => '');
-    const files = alreadyUpToDate ? '' : await run(`git diff --name-status ${oldRev} ${newRev}`).catch(() => '');
-    await run(`git reset --hard ${newRev}`);
-    await run('git clean -fd');
-    return { oldRev, newRev, alreadyUpToDate, commits, files };
-}
-
-function downloadFile(url, dest, visited = new Set()) {
-    return new Promise((resolve, reject) => {
-        try {
-            // Avoid infinite redirect loops
-            if (visited.has(url) || visited.size > 5) {
-                return reject(new Error('Too many redirects'));
-            }
-            visited.add(url);
-
-            const useHttps = url.startsWith('https://');
-            const client = useHttps ? require('https') : require('http');
-            const req = client.get(url, {
-                headers: {
-                    'User-Agent': 'KnightBot-Updater/1.0',
-                    'Accept': '*/*'
-                }
-            }, res => {
-                // Handle redirects
-                if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
-                    const location = res.headers.location;
-                    if (!location) return reject(new Error(`HTTP ${res.statusCode} without Location`));
-                    const nextUrl = new URL(location, url).toString();
-                    res.resume();
-                    return downloadFile(nextUrl, dest, visited).then(resolve).catch(reject);
-                }
-
-                if (res.statusCode !== 200) {
-                    return reject(new Error(`HTTP ${res.statusCode}`));
-                }
-
-                const file = fs.createWriteStream(dest);
-                res.pipe(file);
-                file.on('finish', () => file.close(resolve));
-                file.on('error', err => {
-                    try { file.close(() => {}); } catch {}
-                    fs.unlink(dest, () => reject(err));
-                });
-            });
-            req.on('error', err => {
-                fs.unlink(dest, () => reject(err));
-            });
-        } catch (e) {
-            reject(e);
-        }
-    });
-}
-
-async function extractZip(zipPath, outDir) {
-    // Try to use platform tools; no extra npm modules required
-    if (process.platform === 'win32') {
-        const cmd = `powershell -NoProfile -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${outDir.replace(/\\/g, '/')}' -Force"`;
-        await run(cmd);
-        return;
-    }
-    // Linux/mac: try unzip, else 7z, else busybox unzip
-    try {
-        await run('command -v unzip');
-        await run(`unzip -o '${zipPath}' -d '${outDir}'`);
-        return;
-    } catch {}
-    try {
-        await run('command -v 7z');
-        await run(`7z x -y '${zipPath}' -o'${outDir}'`);
-        return;
-    } catch {}
-    try {
-        await run('busybox unzip -h');
-        await run(`busybox unzip -o '${zipPath}' -d '${outDir}'`);
-        return;
-    } catch {}
-    throw new Error("No system unzip tool found (unzip/7z/busybox). Git mode is recommended on this panel.");
-}
-
-function copyRecursive(src, dest, ignore = [], relative = '', outList = []) {
-    if (!fs.existsSync(dest)) fs.mkdirSync(dest, { recursive: true });
-    for (const entry of fs.readdirSync(src)) {
-        if (ignore.includes(entry)) continue;
-        const s = path.join(src, entry);
-        const d = path.join(dest, entry);
-        const stat = fs.lstatSync(s);
-        if (stat.isDirectory()) {
-            copyRecursive(s, d, ignore, path.join(relative, entry), outList);
-        } else {
-            fs.copyFileSync(s, d);
-            if (outList) outList.push(path.join(relative, entry).replace(/\\/g, '/'));
-        }
-    }
-}
-
-async function updateViaZip(sock, chatId, message, zipOverride) {
-    const zipUrl = (zipOverride || settings.updateZipUrl || process.env.UPDATE_ZIP_URL || REPO_ZIP_URL).trim();
-    const tmpDir = path.join(process.cwd(), 'tmp');
-    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-    const zipPath = path.join(tmpDir, 'update.zip');
-    await downloadFile(zipUrl, zipPath);
-    const extractTo = path.join(tmpDir, 'update_extract');
-    if (fs.existsSync(extractTo)) fs.rmSync(extractTo, { recursive: true, force: true });
-    await extractZip(zipPath, extractTo);
-
-    // Find the top-level extracted folder (GitHub zips create REPO-branch folder)
-    const [root] = fs.readdirSync(extractTo).map(n => path.join(extractTo, n));
-    const srcRoot = fs.existsSync(root) && fs.lstatSync(root).isDirectory() ? root : extractTo;
-
-    // Copy over while preserving runtime dirs/files
-    const ignore = ['node_modules', '.git', 'session', 'tmp', 'tmp/', 'temp', 'data', 'baileys_store.json'];
-    const copied = [];
-    // Preserve ownerNumber from existing settings.js if present
-    let preservedOwner = null;
-    let preservedBotOwner = null;
-    try {
-        const currentSettings = require('../settings');
-        preservedOwner = currentSettings && currentSettings.ownerNumber ? String(currentSettings.ownerNumber) : null;
-        preservedBotOwner = currentSettings && currentSettings.botOwner ? String(currentSettings.botOwner) : null;
-    } catch {}
-    copyRecursive(srcRoot, process.cwd(), ignore, '', copied);
-    if (preservedOwner) {
-        try {
-            const settingsPath = path.join(process.cwd(), 'settings.js');
-            if (fs.existsSync(settingsPath)) {
-                let text = fs.readFileSync(settingsPath, 'utf8');
-                text = text.replace(/ownerNumber:\s*'[^']*'/, `ownerNumber: '${preservedOwner}'`);
-                if (preservedBotOwner) {
-                    text = text.replace(/botOwner:\s*'[^']*'/, `botOwner: '${preservedBotOwner}'`);
-                }
-                fs.writeFileSync(settingsPath, text);
-            }
-        } catch {}
-    }
-    // Cleanup extracted directory
-    try { fs.rmSync(extractTo, { recursive: true, force: true }); } catch {}
-    try { fs.rmSync(zipPath, { force: true }); } catch {}
-    return { copiedFiles: copied };
-}
-
-async function restartProcess(sock, chatId, message) {
-    try {
-        await sock.sendMessage(chatId, { text: '✅ Update complete! Restarting…' }, { quoted: message });
-    } catch {}
-
-
-    setTimeout(() => {
-        process.exit(1);
-    }, 800);
+    if (current) fs.copyFileSync(target, path.join(ROOT, 'index.backup.js'));
+    fs.renameSync(tmp, target);
+    return true;
 }
 
 async function updateCommand(sock, chatId, message) {
-    const senderId = message.key.participant || message.key.remoteJid;
-    const isOwner = await isOwnerOrSudo(senderId, sock, chatId);
-
-    if (!message.key.fromMe && !isOwner) {
-        await sock.sendMessage(chatId, { text: 'Only bot owner or sudo can use .update' }, { quoted: message });
-        return;
-    }
     try {
-        // Minimal UX
-        await sock.sendMessage(chatId, { text: '🔄 Updating the bot, please wait…' }, { quoted: message });
-        if (await hasGitRepo()) {
-            // silent
-            const { oldRev, newRev, alreadyUpToDate, commits, files } = await updateViaGit();
-            // Short message only: version info
-            const summary = alreadyUpToDate ? `✅ Already up to date: ${newRev}` : `✅ Updated to ${newRev}`;
-            console.log('[update] summary generated');
-            // silent
-            await run('npm install --no-audit --no-fund');
-        } else {
-            const { copiedFiles } = await updateViaZip(sock, chatId, message);
-            // silent
+        if (!isOwner(message, sock)) {
+            await sock.sendMessage(chatId, {
+                text: '❌ Only the bot owner can use this command.'
+            }, { quoted: message });
+            return;
         }
+
+        await sock.sendMessage(chatId, {
+            text: '🔄 *ANDY-XMD restarting, wait...*'
+        }, { quoted: message });
+
+        const notes = [];
+
         try {
-            const v = require('../settings').version || '';
-            await sock.sendMessage(chatId, { text: `✅ Update done. Restarting…` }, { quoted: message });
-        } catch {
-            await sock.sendMessage(chatId, { text: '✅ Restared Successfully\n Type .ping to check latest version.' }, { quoted: message });
+            const added = await syncDependencies();
+            if (added.length) notes.push(`📦 Installed packages: ${added.join(', ')}`);
+        } catch (err) {
+            console.error('[UPDATE] package sync failed:', err.message);
+            notes.push(`⚠️ Package sync failed: ${err.message.slice(0, 120)}`);
         }
-        await restartProcess(sock, chatId, message);
-    } catch (err) {
-        console.error('Update failed:', err);
-        await sock.sendMessage(chatId, { text: `❌ Update failed:\n${String(err.message || err)}` }, { quoted: message });
+
+        try {
+            if (await syncLoader()) notes.push('🧩 Loader (index.js) updated');
+        } catch (err) {
+            console.error('[UPDATE] loader sync failed:', err.message);
+            notes.push(`⚠️ Loader update skipped: ${err.message.slice(0, 120)}`);
+        }
+
+        await sock.sendMessage(chatId, {
+            text: `✅ Pulling the latest code from the fork now.${notes.length ? '\n\n' + notes.join('\n') : ''}\n\nBack in a moment.`
+        }, { quoted: message });
+
+        setTimeout(() => process.exit(1), 3000);
+    } catch (error) {
+        console.error('[UPDATE] failed:', error?.stack || error);
+        await sock.sendMessage(chatId, {
+            text: `❌ Update failed: ${error.message}`
+        }, { quoted: message });
     }
 }
 
